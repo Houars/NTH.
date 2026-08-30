@@ -474,6 +474,7 @@ button:focus-visible, textarea:focus-visible, input:focus-visible {
 }
 .message-identity .dot-logo.compact span { font-size: 12px; background-size: 2.4px 2.4px; background-image: radial-gradient(circle, #e5e5e1 .7px, transparent .82px); }
 .message-identity .dot-logo.compact b { font-size: 10px; }
+.user-avatar { width: 100%; height: 100%; display: block; object-fit: cover; }
 .you-mark { color: #888883; font-family: "Cascadia Mono", Consolas, monospace; font-size: 8px; font-weight: 700; letter-spacing: .04em; }
 .message-content { min-width: 0; }
 .message-meta { height: 18px; display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
@@ -750,6 +751,55 @@ button:focus-visible, textarea:focus-visible, input:focus-visible {
 .settings-header h2 { margin: 6px 0 0; color: #e4e4df; font-size: 20px; font-weight: 500; letter-spacing: -.035em; }
 .settings-section { padding: 0 0 23px; margin: 0 0 23px; border-bottom: 1px solid #1b1b1d; }
 .settings-section h3 { margin: 0 0 11px; }
+.profile-card {
+  min-height: 76px;
+  display: grid;
+  grid-template-columns: 48px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid #242426;
+  border-radius: 11px;
+  background: linear-gradient(145deg, #151516, #111112);
+}
+.profile-avatar {
+  width: 48px;
+  height: 48px;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border: 1px solid #303032;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 28%, #252527, #141415 72%);
+  color: #777772;
+}
+.profile-avatar img { width: 100%; height: 100%; display: block; object-fit: cover; }
+.profile-avatar.has-image { border-color: #48484a; }
+.profile-avatar.compact { width: 28px; height: 28px; }
+.profile-card-copy { min-width: 0; display: grid; gap: 4px; }
+.profile-card-copy strong { color: #d4d4cf; font-size: 11px; font-weight: 600; }
+.profile-card-copy span, .profile-card-copy small { color: #63635e; font-size: 8.5px; line-height: 1.35; }
+.profile-card-copy small { color: #8a8a85; }
+.profile-actions { display: flex; align-items: center; gap: 5px; }
+.profile-actions button {
+  height: 31px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  border: 1px solid #303032;
+  border-radius: 16px;
+  background: #1c1c1d;
+  color: #aaa9a4;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 7px;
+  font-weight: 800;
+  letter-spacing: .06em;
+  cursor: pointer;
+}
+.profile-actions button:hover { border-color: #49494b; color: #f0f0eb; }
+.profile-actions button.remove-avatar { width: 31px; justify-content: center; padding: 0; border-color: #3d2624; color: #b66561; }
+.profile-actions button.remove-avatar:hover { border-color: #63312e; background: #211211; color: #ed7d78; }
 .status-card {
   height: 59px;
   display: grid;

@@ -8,6 +8,7 @@ import {
 } from "react";
 import {
   ArrowDown,
+  Camera,
   Check,
   CircleStop,
   Copy,
@@ -27,6 +28,7 @@ import {
   Settings2,
   Square,
   Trash2,
+  UserRound,
   X,
   Zap
 } from "lucide-react";
@@ -67,17 +69,25 @@ const modes: NthMode[] = ["RUN", "JOG", "WALK"];
 
 type SettingsState = {
   searxngUrl: string;
+  profileAvatar: string;
 };
 
 const defaultSettings: SettingsState = {
-  searxngUrl: "http://127.0.0.1:8888"
+  searxngUrl: "http://127.0.0.1:8888",
+  profileAvatar: ""
 };
 
 type UpdateStatus = "idle" | "checking" | "current" | "available" | "downloading" | "error";
 
 function loadSettings(): SettingsState {
   try {
-    return { ...defaultSettings, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}") };
+    const saved = { ...defaultSettings, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}") } as SettingsState;
+    return {
+      ...saved,
+      profileAvatar: typeof saved.profileAvatar === "string" && saved.profileAvatar.startsWith("data:image/")
+        ? saved.profileAvatar
+        : ""
+    };
   } catch {
     return defaultSettings;
   }
@@ -95,6 +105,42 @@ function dataUrlFor(file: File): Promise<string> {
     reader.onerror = () => reject(reader.error);
     reader.readAsDataURL(file);
   });
+}
+
+async function avatarDataUrlFor(file: File): Promise<string> {
+  if (!file.type.startsWith("image/")) throw new Error("Choose an image file.");
+  if (file.size > 15 * 1024 * 1024) throw new Error("Choose an image smaller than 15 MB.");
+
+  const source = await dataUrlFor(file);
+  const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+    const element = new Image();
+    element.onload = () => resolve(element);
+    element.onerror = () => reject(new Error("NTH could not read that image."));
+    element.src = source;
+  });
+
+  const size = Math.min(image.naturalWidth, image.naturalHeight);
+  if (!size) throw new Error("NTH could not read that image.");
+
+  const canvas = document.createElement("canvas");
+  canvas.width = 256;
+  canvas.height = 256;
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("NTH could not prepare that image.");
+
+  context.drawImage(
+    image,
+    Math.floor((image.naturalWidth - size) / 2),
+    Math.floor((image.naturalHeight - size) / 2),
+    size,
+    size,
+    0,
+    0,
+    256,
+    256
+  );
+
+  return canvas.toDataURL("image/webp", 0.88);
 }
 
 function friendlyError(error: unknown): string {
@@ -130,6 +176,14 @@ function DotLogo({ compact = false }: { compact?: boolean }) {
     <div className={`dot-logo ${compact ? "compact" : ""}`} aria-label="NTH">
       <span>NTH</span><b>.</b>
     </div>
+  );
+}
+
+function ProfileAvatar({ source, compact = false }: { source: string; compact?: boolean }) {
+  return (
+    <span className={`profile-avatar ${compact ? "compact" : ""} ${source ? "has-image" : ""}`}>
+      {source ? <img src={source} alt="Your profile" /> : <UserRound size={compact ? 14 : 22} />}
+    </span>
   );
 }
 
@@ -172,13 +226,15 @@ function App() {
   const [maximized, setMaximized] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [composerNotice, setComposerNotice] = useState("");
-  const [appVersion, setAppVersion] = useState("0.5.2");
+  const [appVersion, setAppVersion] = useState("0.5.3");
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("idle");
   const [updateInfo, setUpdateInfo] = useState<NthUpdateInfo | null>(null);
   const [updateMessage, setUpdateMessage] = useState("NTH checks the signed release channel automatically.");
   const [updatePercent, setUpdatePercent] = useState<number | null>(null);
+  const [avatarNotice, setAvatarNotice] = useState("");
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const avatarInputRef = useRef<HTMLInputElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const chatRef = useRef<HTMLElement | null>(null);
   const generationRef = useRef<AbortController | null>(null);
@@ -192,6 +248,18 @@ function App() {
   const groups = useMemo(() => groupConversations(conversations), [conversations]);
   const autoWeb = needsWeb(input);
   const canSend = ready && !busy && Boolean(input.trim() || attachments.length);
+
+  async function chooseAvatar(file?: File) {
+    if (!file) return;
+    setAvatarNotice("Preparing image…");
+    try {
+      const profileAvatar = await avatarDataUrlFor(file);
+      setSettings(current => ({ ...current, profileAvatar }));
+      setAvatarNotice("Saved locally.");
+    } catch (error) {
+      setAvatarNotice(error instanceof Error ? error.message : "NTH could not use that image.");
+    }
+  }
 
   useEffect(() => {
     if (!activeConversation && conversations[0]) setActiveId(conversations[0].id);
@@ -716,7 +784,9 @@ function App() {
                 {messages.map(message => (
                   <article className={`message ${message.role} ${message.error ? "error" : ""}`} key={message.id}>
                     <div className="message-identity">
-                      {message.role === "assistant" ? <DotLogo compact /> : <span className="you-mark">YOU</span>}
+                      {message.role === "assistant" ? <DotLogo compact /> : settings.profileAvatar
+                        ? <img className="user-avatar" src={settings.profileAvatar} alt="Your profile" />
+                        : <span className="you-mark">YOU</span>}
                     </div>
                     <div className="message-content">
                       <div className="message-meta">
@@ -849,6 +919,46 @@ function App() {
               <div><span>SETTINGS</span><h2>Keep it simple.</h2></div>
               <button onClick={() => setSettingsOpen(false)} aria-label="Close settings"><X size={17} /></button>
             </header>
+
+            <section className="settings-section">
+              <h3>PROFILE</h3>
+              <div className="profile-card">
+                <ProfileAvatar source={settings.profileAvatar} />
+                <div className="profile-card-copy">
+                  <strong>Your avatar</strong>
+                  <span>Stored locally on this device.</span>
+                  {avatarNotice ? <small>{avatarNotice}</small> : null}
+                </div>
+                <div className="profile-actions">
+                  <input
+                    ref={avatarInputRef}
+                    type="file"
+                    accept="image/png,image/jpeg,image/webp,image/gif"
+                    hidden
+                    onChange={event => {
+                      void chooseAvatar(event.target.files?.[0]);
+                      event.target.value = "";
+                    }}
+                  />
+                  <button onClick={() => avatarInputRef.current?.click()}>
+                    <Camera size={13} />
+                    <span>{settings.profileAvatar ? "CHANGE" : "ADD"}</span>
+                  </button>
+                  {settings.profileAvatar ? (
+                    <button
+                      className="remove-avatar"
+                      onClick={() => {
+                        setSettings(current => ({ ...current, profileAvatar: "" }));
+                        setAvatarNotice("Avatar removed.");
+                      }}
+                      aria-label="Remove profile avatar"
+                    >
+                      <Trash2 size={13} />
+                    </button>
+                  ) : null}
+                </div>
+              </div>
+            </section>
 
             <section className="settings-section">
               <h3>LOCAL ENGINE</h3>

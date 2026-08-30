@@ -11,6 +11,7 @@ Rust, and Ollama.
 - Screenshot paste, image drop, attachment previews, and vision answers
 - Optional SearXNG web search with ranked citations and evidence verification
 - RUN / JOG / WALK modes, ready for separate model IDs later
+- Local profile avatar with crop, preview, replacement, and removal
 - In-app settings and service status without developer-facing error dumps
 
 ## Protected AI behavior
