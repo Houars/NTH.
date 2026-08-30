@@ -52,7 +52,7 @@ pub enum UpdateEvent {
 }
 
 const NTH_UPDATE_ENDPOINT: &str =
-    "https://github.com/Houars/NTH./releases/latest/download/latest.json";
+    "https://github.com/Houars/NTH/releases/latest/download/latest.json";
 
 fn update_endpoint() -> Result<reqwest::Url, String> {
     reqwest::Url::parse(NTH_UPDATE_ENDPOINT)
