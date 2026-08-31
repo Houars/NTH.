@@ -12,6 +12,7 @@ Rust, and Ollama.
 - Optional SearXNG web search with ranked citations and evidence verification
 - RUN / JOG / WALK modes, ready for separate model IDs later
 - Local profile avatar with crop, preview, replacement, and removal
+- Animated monochrome NTH Glyph Matrix with response-state signals
 - In-app settings and service status without developer-facing error dumps
 
 ## Protected AI behavior

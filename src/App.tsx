@@ -1,8 +1,10 @@
 import {
+  memo,
   useEffect,
   useMemo,
   useRef,
   useState,
+  type CSSProperties,
   type DragEvent,
   type KeyboardEvent as ReactKeyboardEvent
 } from "react";
@@ -78,6 +80,31 @@ const defaultSettings: SettingsState = {
 };
 
 type UpdateStatus = "idle" | "checking" | "current" | "available" | "downloading" | "error";
+type GlyphState = "idle" | "thinking" | "generating" | "web" | "vision" | "error" | "offline";
+
+const NTH_GLYPH_DOTS = [
+  "100011111110001",
+  "110010010010001",
+  "101010010011111",
+  "100110010010001",
+  "100010010010001"
+].flatMap((row, y) => [...row].flatMap((value, x) => {
+  if (value !== "1") return [];
+  const angle = Math.atan2(y - 2, x - 7) + Math.PI;
+  const sweep = Math.round((angle / (Math.PI * 2)) * 11) % 12;
+  const wave = x < 5 ? 0 : x < 10 ? 1 : 2;
+  const focus = Math.min(6, Math.round(Math.hypot((x - 7) * 0.55, y - 2)));
+  return [{
+    x,
+    y,
+    style: {
+      "--thinking-delay": `${(11 - sweep) * -75}ms`,
+      "--wave-delay": `${wave * -233}ms`,
+      "--scan-delay": `${(14 - x) * -59}ms`,
+      "--focus-delay": `${focus * 45}ms`
+    } as CSSProperties
+  }];
+}));
 
 function loadSettings(): SettingsState {
   try {
@@ -179,12 +206,49 @@ function DotLogo({ compact = false }: { compact?: boolean }) {
   );
 }
 
+const NthGlyphAvatar = memo(function NthGlyphAvatar({ state }: { state: GlyphState }) {
+  const label = state === "web" ? "web search" : state;
+  return (
+    <svg
+      className={`nth-glyph state-${state}`}
+      viewBox="0 0 34 12"
+      role="img"
+      aria-label={`NTH assistant — ${label}`}
+    >
+      <title>{`NTH assistant — ${label}`}</title>
+      <g className="nth-glyph-matrix">
+        {NTH_GLYPH_DOTS.map(({ x, y, style }) => (
+          <circle
+            className="nth-glyph-dot"
+            cx={2 + x * 2}
+            cy={2 + y * 2}
+            r="0.72"
+            key={`${x}-${y}`}
+            style={style}
+          />
+        ))}
+      </g>
+      <circle className="nth-glyph-accent" cx="32.1" cy="9.8" r="0.72" />
+    </svg>
+  );
+});
+
 function ProfileAvatar({ source, compact = false }: { source: string; compact?: boolean }) {
   return (
     <span className={`profile-avatar ${compact ? "compact" : ""} ${source ? "has-image" : ""}`}>
       {source ? <img src={source} alt="Your profile" /> : <UserRound size={compact ? 14 : 22} />}
     </span>
   );
+}
+
+function glyphStateFor(message: UiMessage, phase: AnswerPhase | null, ready: boolean): GlyphState {
+  if (message.error) return ready ? "error" : "offline";
+  if (!ready) return "offline";
+  if (!message.streaming) return "idle";
+  if (phase === "searching") return "web";
+  if (!message.content && message.route?.includes("vision")) return "vision";
+  if (message.content) return "generating";
+  return "thinking";
 }
 
 function ModeSelector({ mode, onChange }: { mode: NthMode; onChange: (mode: NthMode) => void }) {
@@ -226,7 +290,7 @@ function App() {
   const [maximized, setMaximized] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [composerNotice, setComposerNotice] = useState("");
-  const [appVersion, setAppVersion] = useState("0.5.3");
+  const [appVersion, setAppVersion] = useState("0.5.4");
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("idle");
   const [updateInfo, setUpdateInfo] = useState<NthUpdateInfo | null>(null);
   const [updateMessage, setUpdateMessage] = useState("NTH checks the signed release channel automatically.");
@@ -783,8 +847,8 @@ function App() {
               <div className="message-list">
                 {messages.map(message => (
                   <article className={`message ${message.role} ${message.error ? "error" : ""}`} key={message.id}>
-                    <div className="message-identity">
-                      {message.role === "assistant" ? <DotLogo compact /> : settings.profileAvatar
+                    <div className={`message-identity ${message.role === "assistant" ? "assistant-glyph-badge" : ""}`}>
+                      {message.role === "assistant" ? <NthGlyphAvatar state={glyphStateFor(message, phase, ready)} /> : settings.profileAvatar
                         ? <img className="user-avatar" src={settings.profileAvatar} alt="Your profile" />
                         : <span className="you-mark">YOU</span>}
                     </div>
