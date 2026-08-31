@@ -5,9 +5,13 @@ import {
   decomposePrompt,
   deriveTopicState,
   isContextualFollowUp,
+  isConversationHistoryIntent,
   isConversationOnlyIntent,
+  markVerifiedWebContext,
   needsFreshWeb,
+  normalizeTopicState,
   recentAnswerContext,
+  requiresReferenceClarification,
   resolveContextualQuery,
   topicTerms,
   type ContextMessage,
@@ -151,6 +155,29 @@ VERIFIED RECENT EVIDENCE:
 ${evidence}`;
 }
 
+function conversationHistoryPolicy(messages: NthMessage[]): string {
+  const all = messages.filter(message => message.content.trim());
+  const usable = all.length <= 60 ? all : [...all.slice(0, 12), ...all.slice(-48)];
+  const timeline = usable.map((message, index) => {
+    const content = message.content.replace(/\s+/g, " ").trim();
+    const clipped = content.length > 320 ? `${content.slice(0, 319).trimEnd()}…` : content;
+    const originalIndex = all.length <= 60 || index < 12 ? index + 1 : all.length - 48 + (index - 12) + 1;
+    return `[${originalIndex} ${message.role === "user" ? "USER" : "NTH"}] ${clipped}`;
+  }).join("\n");
+  return `${NTH_POLICY_V2}
+
+CONVERSATION HISTORY MODE:
+Answer the user's meta-chat/history question from the actual stored timeline below.
+- This is always LOCAL. Do not claim to have searched the web.
+- Read the requested position carefully: beginning, before a named topic, previous, or most recent meaningful topic.
+- Prefer USER messages when the user asks what they asked.
+- If the requested point is not present in the timeline, say so plainly.
+- Do not substitute compressed topic state for the timeline.
+
+ACTUAL CHAT TIMELINE:
+${timeline}`;
+}
+
 function shouldVerifyWeb(intent: string): boolean {
   return ["current_product", "latest_news", "price", "rumor"].includes(intent);
 }
@@ -219,7 +246,10 @@ function parseBirthDate(text: string): string | null {
 }
 
 function ageFactsFromSources(sources: SearchSource[], state: TopicState, now = new Date()): AgeFact[] {
-  const subjects = state.entities.length ? state.entities : state.topic ? [state.topic] : [];
+  const normalized = normalizeTopicState(state);
+  const subjects = normalized.recentEntities.length
+    ? normalized.recentEntities
+    : normalized.currentExplicitSubject ? [normalized.currentExplicitSubject] : [];
   const facts: AgeFact[] = [];
   for (const source of sources) {
     const text = `${source.title}. ${source.snippet}. ${source.content || ""}`;
@@ -236,7 +266,8 @@ function ageFactsFromSources(sources: SearchSource[], state: TopicState, now = n
 }
 
 function ageGrounding(sources: SearchSource[], state: TopicState): string {
-  const asksAge = state.focus === "age" || /\b(?:how old|age|older|youngest)\b/i.test(state.topic);
+  const normalized = normalizeTopicState(state);
+  const asksAge = normalized.focus === "age" || /\b(?:how old|age|older|youngest)\b/i.test(normalized.currentExplicitSubject);
   if (!asksAge) return "";
   const facts = ageFactsFromSources(sources, state);
   if (!facts.length) {
@@ -274,19 +305,80 @@ function canReuseVerifiedContext(text: string, query: string, state: TopicState,
   if (/\b(?:power|watt|tdp)\b/i.test(query) && !/\b(?:power|watt|tdp)\b/i.test(evidence)) return false;
   if (/\b(?:price|cost|how much)\b/i.test(query) && !/\b(?:price|cost|\$|€|£)\b/i.test(evidence)) return false;
   if (/\b(?:older|how old|age)\b/i.test(query) && !/\b(?:born|birth|age|years? old)\b/i.test(evidence)) return false;
-  if (/\bolder\b/i.test(query) && state.entities.length > 1) {
-    if (!state.entities.slice(0, 2).every(entity => haystack.includes(entity.toLowerCase()))) return false;
+  if (/\bolder\b/i.test(query) && state.recentEntities.length > 1) {
+    if (!state.recentEntities.slice(0, 2).every(entity => haystack.includes(entity.toLowerCase()))) return false;
   }
   if (state.focus === "performance" && !/\b(?:performance|benchmark|fps|score|faster|slower)\b/i.test(evidence)) return false;
   if (state.focus === "availability" && !/\b(?:available|availability|stock|released|shipping)\b/i.test(evidence)) return false;
+  if (state.focus === "current product" && !/\b(?:current|released|model|available)\b/i.test(evidence)) return false;
   if (
     state.focus
-    && !["age", "power consumption", "price", "performance", "availability"].includes(state.focus)
+    && !["age", "power consumption", "price", "performance", "availability", "current product"].includes(state.focus)
     && !haystack.includes(state.focus.toLowerCase())
   ) return false;
   return /^(?:which(?: one)?|who is older|why|how)[!?. ]*$/i.test(text.trim())
     || /\b(?:he|she|it|they|this|that|other one)\b/i.test(text)
     || terms.some(term => haystack.includes(term));
+}
+
+function evidenceMatchesSubject(
+  request: { question: string; query: string },
+  sources: SearchSource[],
+  state: TopicState,
+  preferExplicitSubject: boolean
+): boolean {
+  if (!sources.length) return false;
+  const normalized = normalizeTopicState(state);
+  const subject = preferExplicitSubject && normalized.currentExplicitSubject
+    ? normalized.currentExplicitSubject
+    : request.query;
+  const stop = new Set(["what", "which", "when", "where", "with", "from", "that", "this", "have", "does", "about", "latest", "newest", "current", "exact", "released", "model", "official", "sources", "research", "deeper", "person", "each"]);
+  const tokens = subject.toLowerCase().split(/[^a-z0-9]+/).filter(token => token.length >= 3 && !stop.has(token));
+  if (!tokens.length) return true;
+  return sources.some(source => {
+    const haystack = `${source.title} ${source.snippet} ${source.domain}`.toLowerCase();
+    return tokens.some(token => haystack.includes(token));
+  });
+}
+
+function transientSearchFailure(error: unknown): boolean {
+  return /timeout|timed out|connection|connect|refused|temporar|unavailable|all searxng searches failed/i.test(String(error));
+}
+
+async function searchWithOneRetry(request: { question: string; query: string }, web: WebSettings): Promise<SearchBundle> {
+  try {
+    return await invoke<SearchBundle>("searxng_smart_search", {
+      query: request.query,
+      searxngUrl: web.searxngUrl,
+      maxSources: 6
+    });
+  } catch (error) {
+    if (!transientSearchFailure(error)) throw error;
+    await new Promise(resolve => window.setTimeout(resolve, 280));
+    return invoke<SearchBundle>("searxng_smart_search", {
+      query: request.query,
+      searxngUrl: web.searxngUrl,
+      maxSources: 6
+    });
+  }
+}
+
+async function searchWithConcurrency(
+  requests: Array<{ question: string; query: string }>,
+  web: WebSettings,
+  concurrency = 2
+): Promise<SearchBundle[]> {
+  const results = new Array<SearchBundle>(requests.length);
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < requests.length) {
+      const index = cursor;
+      cursor += 1;
+      results[index] = await searchWithOneRetry(requests[index], web);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, requests.length) }, worker));
+  return results;
 }
 
 function uniqueSources(bundles: SearchBundle[], maximum = 10): SearchSource[] {
@@ -366,7 +458,17 @@ export async function answerNth(args: {
   const text = lastUser?.content ?? "";
   const hasVision = Boolean(lastUser?.attachments?.length);
   const priorMessages = lastUserIndex >= 0 ? messages.slice(0, lastUserIndex) : messages;
-  const nextTopicState = deriveTopicState(messages, previousTopicState);
+  const nextTopicState = normalizeTopicState(deriveTopicState(messages, previousTopicState));
+  const historyIntent = isConversationHistoryIntent(text);
+  if (!hasVision && requiresReferenceClarification(text, nextTopicState, priorMessages)) {
+    return {
+      content: "Which subject do you mean? Name it once and I’ll continue from there.",
+      route: "local",
+      sources: [],
+      contextReused: false,
+      topicState: nextTopicState
+    };
+  }
   const parts = decomposePrompt(text, 5);
   const subquestions = parts.length ? parts : [text];
   const baseSearchRequests = subquestions.flatMap(part => {
@@ -374,14 +476,14 @@ export async function answerNth(args: {
       ? messages
       : [...priorMessages, { role: "user" as const, content: part }];
     const resolved = resolveContextualQuery(partMessages, nextTopicState) || part;
-    const requiresWeb = forceWeb || needsWeb(part, priorMessages);
+    const requiresWeb = !historyIntent && (forceWeb || needsWeb(part, priorMessages));
     return requiresWeb ? [{ question: part, query: resolved }] : [];
   });
   const searchRequests = baseSearchRequests.length === 1
     && !isContextualFollowUp(text)
     && nextTopicState.focus === "age"
-    && nextTopicState.entities.length > 1
-    ? nextTopicState.entities.slice(0, 4).map(entity => ({
+    && nextTopicState.recentEntities.length > 1
+    ? nextTopicState.recentEntities.slice(0, 4).map(entity => ({
         question: baseSearchRequests[0].question,
         query: `${entity} date of birth age of ${entity}`
       }))
@@ -399,6 +501,9 @@ export async function answerNth(args: {
   let evidence = "";
   let intent = "";
   let contextReused = false;
+  let finalTopicState = nextTopicState;
+
+  if (historyIntent) policy = conversationHistoryPolicy(messages);
 
   const recentVerified = !forceWeb && searchRequests.length === 1
     ? verifiedEvidenceFrom(priorMessages)
@@ -412,15 +517,22 @@ export async function answerNth(args: {
     evidence = recentVerified.evidence;
     policy = verifiedContextPolicy(evidence, searchRequests[0].query)
       + ageGrounding(sources, nextTopicState);
+    finalTopicState = markVerifiedWebContext(
+      nextTopicState,
+      nextTopicState.currentExplicitSubject || searchRequests[0].query
+    );
   }
 
   if (searchRequests.length && !contextReused) {
     onPhase?.("searching");
-    const bundles = await Promise.all(searchRequests.map(request => invoke<SearchBundle>("searxng_smart_search", {
-      query: request.query,
-      searxngUrl: web.searxngUrl,
-      maxSources: 6
-    })));
+    const bundles = await searchWithConcurrency(searchRequests, web, 2);
+
+    const unrelatedIndex = bundles.findIndex((bundle, index) =>
+      !evidenceMatchesSubject(searchRequests[index], bundle.sources, nextTopicState, searchRequests.length === 1)
+    );
+    if (unrelatedIndex >= 0) {
+      throw new Error(`SearXNG returned no useful evidence for "${searchRequests[unrelatedIndex].query}".`);
+    }
 
     sources = uniqueSources(bundles);
     evidence = bundles.map((bundle, index) => [
@@ -433,6 +545,10 @@ export async function answerNth(args: {
       ? "\n- Answer every subquestion in the user's original order. Keep the numbering/order clear."
       : "";
     policy = webPolicy(evidence, intent, resolvedQuery) + orderingRule + ageGrounding(sources, nextTopicState);
+    finalTopicState = markVerifiedWebContext(
+      nextTopicState,
+      nextTopicState.currentExplicitSubject || searchRequests[0].query
+    );
   }
 
   if (signal?.aborted) throw abortError();
@@ -492,6 +608,6 @@ export async function answerNth(args: {
     sources,
     searchQuery: searchRequests.length ? resolvedQuery : undefined,
     contextReused,
-    topicState: nextTopicState
+    topicState: finalTopicState
   };
 }

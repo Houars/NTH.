@@ -16,6 +16,7 @@ Rust, and Ollama.
 - Recent-turn contextual follow-ups with date-aware automatic WEB routing
 - Conversation-only routing precedence and verified-context reuse without repeat searches
 - Lightweight per-chat topic state, capped multi-question search decomposition, and deterministic age calculation
+- Separated explicit/search/history context with failed-search protection and bounded local-search retries
 - Collapsed-by-default verified source cards
 - In-app settings and service status without developer-facing error dumps
 

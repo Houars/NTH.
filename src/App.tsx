@@ -60,6 +60,7 @@ import {
   type Conversation,
   type UiMessage
 } from "./lib/history";
+import { deriveTopicState, isConversationHistoryIntent } from "./lib/context";
 import {
   checkNthUpdate,
   installNthUpdate,
@@ -186,7 +187,7 @@ function friendlyError(error: unknown): string {
 }
 
 function predictedRoute(text: string, hasVision: boolean, forceWeb: boolean, context: UiMessage[] = []): Route {
-  const useWeb = forceWeb || needsWeb(text, context);
+  const useWeb = !isConversationHistoryIntent(text) && (forceWeb || needsWeb(text, context));
   if (hasVision && useWeb) return "vision+web";
   if (hasVision) return "vision";
   if (useWeb) return "web";
@@ -292,7 +293,7 @@ function App() {
   const [maximized, setMaximized] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [composerNotice, setComposerNotice] = useState("");
-  const [appVersion, setAppVersion] = useState("0.5.6");
+  const [appVersion, setAppVersion] = useState("0.5.7");
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("idle");
   const [updateInfo, setUpdateInfo] = useState<NthUpdateInfo | null>(null);
   const [updateMessage, setUpdateMessage] = useState("NTH checks the signed release channel automatically.");
@@ -598,10 +599,12 @@ function App() {
       streaming: true
     };
     const requestMessages = [...messages, userMessage];
+    const requestTopicState = deriveTopicState(requestMessages, activeConversation.context);
     const hasPriorUserMessage = messages.some(message => message.role === "user");
 
     updateConversation(conversationId, conversation => ({
       ...conversation,
+      context: requestTopicState,
       title: hasPriorUserMessage ? conversation.title : titleForMessage(text, Boolean(sentAttachments.length)),
       updatedAt: Date.now(),
       messages: [...conversation.messages, userMessage, assistantMessage]
@@ -631,7 +634,7 @@ function App() {
         mode,
         forceWeb: webForced,
         web: { searxngUrl: settings.searxngUrl },
-        topicState: activeConversation.context,
+        topicState: requestTopicState,
         signal: controller.signal,
         onPhase: nextPhase => setPhase(nextPhase),
         onToken: token => {

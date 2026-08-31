@@ -1,5 +1,5 @@
 import type { NthMessage, Route, SearchSource } from "./nth";
-import type { TopicState } from "./context";
+import { emptyTopicState, normalizeTopicState, type TopicState } from "./context";
 
 export type UiMessage = NthMessage & {
   id: string;
@@ -35,7 +35,8 @@ export function createConversation(now = Date.now()): Conversation {
     title: "New conversation",
     createdAt: now,
     updatedAt: now,
-    messages: []
+    messages: [],
+    context: emptyTopicState()
   };
 }
 
@@ -76,7 +77,8 @@ function normalizeConversation(conversation: Conversation): Conversation {
     title: conversation.title?.trim() || "New conversation",
     createdAt,
     updatedAt: Number(conversation.updatedAt) || createdAt,
-    messages: conversation.messages.map(message => normalizeMessage(message, createdAt))
+    messages: conversation.messages.map(message => normalizeMessage(message, createdAt)),
+    context: normalizeTopicState(conversation.context)
   };
 }
 

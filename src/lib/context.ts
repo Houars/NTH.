@@ -4,8 +4,11 @@ export type ContextMessage = {
 };
 
 export type TopicState = {
-  topic: string;
-  entities: string[];
+  currentExplicitSubject: string;
+  lastMeaningfulUserTopic: string;
+  currentWebSubject: string;
+  recentEntities: string[];
+  recentVerifiedSubjects: string[];
   focus: string;
 };
 
@@ -32,11 +35,23 @@ const CONVERSATION_ONLY_PATTERNS = [
   /^(?:hi|hello|hey|yo|good\s+(?:morning|afternoon|evening)|how are you|how's it going)[!?. ]*$/i,
   /^(?:ok|okay|thanks|thank you|got it|understood|cool|nice|great|alright|sure|fair enough)[!?. ]*$/i,
   /\b(?:tell me (?:a|another) joke|make me laugh|say something funny)\b/i,
-  /\b(?:what (?:were|was) we talking about|what did (?:i|you) say|what was (?:the|our) previous topic|did i (?:ask|mention)|did you (?:say|mention))\b/i,
+  /\b(?:what (?:were|was) we talking about|what did (?:i|you) (?:ask|say)|what was (?:the|our) previous topic|did i (?:ask|mention)|did you (?:say|mention)|who were we talking about)\b/i,
+  /\b(?:last meaningful|previous) topic\b(?:.*\bbefore\b)?/i,
   /^(?:and\s+)?(?:what\s+about\s+)?before that[!?. ]*$/i,
   /\b(?:this|our|the current)\s+(?:chat|conversation)\b/i,
   /\b(?:summari[sz]e|recap)\s+(?:this|our|the)\s+(?:chat|conversation|discussion)\b/i,
   /^(?:what do you mean(?: by (?:that|this|it))?|(?:can|could|would) you (?:clarify|explain|rephrase|expand on) (?:that|this|it|your answer)|clarify that|explain what you meant)[!?. ]*$/i
+];
+
+const CONVERSATION_HISTORY_PATTERNS = [
+  /\bwhat (?:were|was) we talking about\b/i,
+  /\bwhat did (?:i|you) (?:ask|say)\b/i,
+  /\bwho were we talking about\b/i,
+  /\b(?:last meaningful|previous) topic\b/i,
+  /\b(?:who|what) (?:were|was) we\b.*\bat the beginning\b/i,
+  /\b(?:last meaningful|previous) topic\b(?:.*\bbefore\b)?/i,
+  /^(?:and\s+)?(?:what\s+about\s+)?before that[!?. ]*$/i,
+  /\b(?:recap|summari[sz]e)\s+(?:this|our|the)\s+(?:chat|conversation|discussion)\b/i
 ];
 
 const ENTITY_PATTERNS = [
@@ -68,6 +83,13 @@ function trimQuery(text: string): string {
   return normalized.length > 220 ? normalized.slice(0, 220).trimEnd() : normalized;
 }
 
+function externalQueryText(text: string): string {
+  const value = compact(text);
+  if (!/^\s*(?:please\s+)?forget\b/i.test(value)) return value;
+  const boundary = value.search(/[.!?]\s*(?=(?:what|who|how|which|now|back|let|switch)\b)|,\s*(?=(?:now|back|switch)\b)/i);
+  return boundary >= 0 ? value.slice(boundary + 1).trim() : value;
+}
+
 export function isContextualFollowUp(text: string): boolean {
   const value = compact(text);
   if (/^who\s+is\s+older\b/i.test(value) && extractEntities(value).length) return false;
@@ -81,6 +103,37 @@ export function isContextualFollowUp(text: string): boolean {
 export function isConversationOnlyIntent(text: string): boolean {
   const value = compact(text);
   return CONVERSATION_ONLY_PATTERNS.some(pattern => pattern.test(value));
+}
+
+export function isConversationHistoryIntent(text: string): boolean {
+  const value = compact(text);
+  return CONVERSATION_HISTORY_PATTERNS.some(pattern => pattern.test(value));
+}
+
+export function emptyTopicState(): TopicState {
+  return {
+    currentExplicitSubject: "",
+    lastMeaningfulUserTopic: "",
+    currentWebSubject: "",
+    recentEntities: [],
+    recentVerifiedSubjects: [],
+    focus: ""
+  };
+}
+
+export function normalizeTopicState(value?: Partial<TopicState> & { topic?: string; entities?: string[] }): TopicState {
+  const fallback = emptyTopicState();
+  if (!value) return fallback;
+  const legacyTopic = typeof value.topic === "string" ? value.topic : "";
+  const legacyEntities = Array.isArray(value.entities) ? value.entities.filter(item => typeof item === "string") : [];
+  return {
+    currentExplicitSubject: value.currentExplicitSubject || legacyTopic,
+    lastMeaningfulUserTopic: value.lastMeaningfulUserTopic || legacyTopic,
+    currentWebSubject: value.currentWebSubject || "",
+    recentEntities: Array.isArray(value.recentEntities) ? value.recentEntities : legacyEntities,
+    recentVerifiedSubjects: Array.isArray(value.recentVerifiedSubjects) ? value.recentVerifiedSubjects : [],
+    focus: value.focus || ""
+  };
 }
 
 export function needsFreshWeb(
@@ -160,6 +213,38 @@ function extractEntities(text: string): string[] {
   return [...new Set(entities.map(entity => entity.replace(/[?!.,]+$/g, "")))];
 }
 
+const GENERIC_SUBJECT_PATTERN = /\b(?:nvidia\s+|amd\s+)?(?:gpus?|graphics cards?|cpus?|processors?)\b|\b(?:minecraft|demon slayer|ollama|searxng)\b/gi;
+
+function explicitSubjectFrom(text: string): { subject: string; entities: string[]; switched: boolean; cleared: boolean } {
+  const value = compact(text);
+  const forgets = /^\s*(?:please\s+)?forget\b/i.test(value);
+  let searchable = value;
+  if (forgets) {
+    const switchAfterForget = value.search(/[.!?]\s*(?=(?:what|who|how|which|now|back|let|switch)\b)|,\s*(?=(?:now|back|switch)\b)/i);
+    if (switchAfterForget < 0) return { subject: "", entities: [], switched: true, cleared: true };
+    searchable = value.slice(switchAfterForget + 1).trim();
+  }
+
+  const candidates = extractEntities(searchable).map(subject => ({
+    subject,
+    index: searchable.toLowerCase().lastIndexOf(subject.toLowerCase())
+  }));
+  GENERIC_SUBJECT_PATTERN.lastIndex = 0;
+  for (const match of searchable.matchAll(GENERIC_SUBJECT_PATTERN)) {
+    candidates.push({ subject: compact(match[0]), index: match.index ?? 0 });
+  }
+
+  const switchMatch = searchable.match(/^(?:now|back to(?: the)?|switch(?:ing)? to|let(?:'s| us) (?:talk about|return to))\s+(.+?)(?:[.!?]|$)/i);
+  if (switchMatch) candidates.push({ subject: trimQuery(switchMatch[1]), index: searchable.length + 1 });
+
+  const selected = candidates
+    .filter(candidate => candidate.subject && candidate.index >= 0)
+    .sort((a, b) => b.index - a.index)[0]?.subject || "";
+  const entities = [...new Set([selected, ...extractEntities(searchable)].filter(Boolean))].slice(0, 6);
+  const switched = forgets || Boolean(switchMatch) || Boolean(selected);
+  return { subject: selected, entities, switched, cleared: forgets && !selected };
+}
+
 function fallbackTopic(text: string): string {
   if (isContextualFollowUp(text)) return "";
   const normalized = trimQuery(text)
@@ -187,18 +272,6 @@ function topicsFromRecentMessages(messages: ContextMessage[]): string[] {
   return [...new Set([...userTopics, ...assistantTopics])];
 }
 
-function bestRecentTopic(messages: ContextMessage[]): string {
-  const topics = topicsFromRecentMessages(messages);
-  if (!topics.length) return "";
-  const nearest = topics[0];
-  const nearestTokens = nearest.toLowerCase().split(/\s+/).filter(token => token.length > 2);
-  const expanded = topics.find(topic => {
-    const lower = topic.toLowerCase();
-    return topic.length > nearest.length && nearestTokens.some(token => lower.includes(token));
-  });
-  return expanded || nearest;
-}
-
 function exactCurrentProductQuery(query: string): string {
   const asksExactCurrent = /\b(?:newest|latest|current|most recent)\b/i.test(query);
   if (!asksExactCurrent) return query;
@@ -215,13 +288,17 @@ function focusFrom(text: string): string {
   const value = compact(text);
   if (/\b(?:how old|age|older|youngest)\b/i.test(value)) return "age";
   if (/\b(?:power consumption|power draw|tdp|wattage|watts?)\b/i.test(value)) return "power consumption";
-  if (/\b(?:price|pricing|cost|how much)\b/i.test(value)) return "price";
+  if (/\b(?:price|pricing|cost)\b/i.test(value) || /\bhow much (?:is|does .+ cost)\b/i.test(value)) return "price";
   if (/\b(?:performance|benchmark|how good|fast)\b/i.test(value)) return "performance";
   if (/\b(?:available|availability|in stock)\b/i.test(value)) return "availability";
+  if (/\b(?:newest|latest|current|most recent)\b/i.test(value)) return "current product";
   if (/^(?:which(?:\s+one)?|why|how)[!?. ]*$/i.test(value)) return "";
+  if (!isContextualFollowUp(value)) return "";
 
   const remainder = value
     .replace(/^(?:and\s+)?what\s+about\s+/i, "")
+    .replace(/^(?:how much|how many|what|which)\s+/i, "")
+    .replace(/\b(?:do|does|did|is|are|was|were|have|has)\b/gi, "")
     .replace(/\b(?:he|she|it|they|this|that|him|her|them|his|its|their|the other one)\b/gi, "")
     .replace(/[?!.,]+/g, " ")
     .replace(/\s+/g, " ")
@@ -254,9 +331,8 @@ function resolveOtherOne(messages: ContextMessage[]): string {
   return "";
 }
 
-function researchSuffix(messages: ContextMessage[]): string {
-  const recent = messages.map(message => message.content).join(" ");
-  return /\b(?:anime|manga|character|demon slayer|tanjiro|kamado)\b/i.test(recent)
+function researchSuffix(subject: string): string {
+  return /\b(?:anime|manga|character|demon slayer|tanjiro|kamado)\b/i.test(subject)
     ? "official sources manga anime character profile"
     : "official primary sources detailed analysis";
 }
@@ -264,42 +340,105 @@ function researchSuffix(messages: ContextMessage[]): string {
 export function deriveTopicState(messages: ContextMessage[], previous?: TopicState): TopicState {
   const recent = recentAnswerContext(messages);
   const current = [...recent].reverse().find(message => message.role === "user");
+  const base = normalizeTopicState(previous);
   if (!current || isConversationOnlyIntent(current.content)) {
-    return previous || { topic: "", entities: [], focus: "" };
+    return base;
+  }
+
+  const explicit = explicitSubjectFrom(current.content);
+  const explicitFocus = focusFrom(current.content);
+  if (explicit.switched) {
+    const comparison = explicit.entities.length >= 2 && /\b(?:compare|versus|vs\.?|older|difference|between)\b/i.test(current.content);
+    const subject = explicit.cleared
+      ? ""
+      : comparison ? `${explicit.entities[0]} vs ${explicit.entities[1]}` : explicit.subject;
+    return {
+      ...base,
+      currentExplicitSubject: subject,
+      lastMeaningfulUserTopic: subject || base.lastMeaningfulUserTopic,
+      recentEntities: explicit.entities.length
+        ? [...new Set([...explicit.entities, ...base.recentEntities])].slice(0, 8)
+        : base.recentEntities,
+      focus: explicitFocus
+    };
   }
 
   if (isContextualFollowUp(current.content)) {
+    const latestPriorSwitch = [...recent.slice(0, -1)].reverse()
+      .filter(message => message.role === "user")
+      .map(message => ({ resolution: explicitSubjectFrom(message.content), focus: focusFrom(message.content) }))
+      .find(result => result.resolution.switched);
+    const contextualBase = latestPriorSwitch
+      ? {
+          ...base,
+          currentExplicitSubject: latestPriorSwitch.resolution.cleared ? "" : latestPriorSwitch.resolution.subject,
+          lastMeaningfulUserTopic: latestPriorSwitch.resolution.subject || base.lastMeaningfulUserTopic,
+          recentEntities: latestPriorSwitch.resolution.entities.length
+            ? [...new Set([...latestPriorSwitch.resolution.entities, ...base.recentEntities])].slice(0, 8)
+            : base.recentEntities,
+          focus: latestPriorSwitch.focus
+        }
+      : base;
     const recentTopics = topicsFromRecentMessages(recent.slice(0, -1)).slice(0, 4);
     const comparison = /^who\s+is\s+older\b/i.test(current.content);
     const entities = comparison
-      ? [...new Set([...(previous?.entities || []), ...recentTopics])].slice(0, 4)
-      : previous?.entities.length
-        ? previous.entities
-        : recentTopics;
-    const topic = comparison && entities.length >= 2
-      ? `${entities[0]} vs ${entities[1]}`
-      : previous?.topic || bestRecentTopic(recent.slice(0, -1));
-    const explicitFocus = focusFrom(current.content);
+      ? [...new Set([...contextualBase.recentEntities, ...recentTopics])].slice(0, 4)
+      : contextualBase.recentEntities;
+    const comparisonSubject = comparison && entities.length >= 2 ? `${entities[0]} vs ${entities[1]}` : "";
     return {
-      topic,
-      entities,
+      ...contextualBase,
+      currentExplicitSubject: comparisonSubject || contextualBase.currentExplicitSubject,
+      recentEntities: entities,
       focus: RESEARCH_COMMAND.test(current.content) || VERIFY_COMMAND.test(current.content)
-        ? previous?.focus || explicitFocus
-        : explicitFocus || previous?.focus || ""
+        ? contextualBase.focus || explicitFocus
+        : explicitFocus || contextualBase.focus
     };
   }
 
   const entities = extractEntities(current.content).slice(0, 4);
   const fallback = fallbackTopic(current.content);
-  const topic = entities.length >= 2
+  const subject = entities.length >= 2
     ? `${entities[0]} vs ${entities[1]}`
-    : entities[0] || fallback || previous?.topic || "";
-  return { topic, entities: entities.length ? entities : previous?.entities || [], focus: focusFrom(current.content) };
+    : entities[0] || fallback;
+  if (!subject) return { ...base, focus: explicitFocus };
+  return {
+    ...base,
+    currentExplicitSubject: subject,
+    lastMeaningfulUserTopic: subject,
+    recentEntities: [...new Set([...(entities.length ? entities : [subject]), ...base.recentEntities])].slice(0, 8),
+    focus: explicitFocus
+  };
+}
+
+export function markVerifiedWebContext(state: TopicState, subject: string): TopicState {
+  const current = normalizeTopicState(state);
+  const resolved = trimQuery(subject) || current.currentExplicitSubject;
+  return {
+    ...current,
+    currentWebSubject: resolved,
+    recentVerifiedSubjects: resolved
+      ? [...new Set([resolved, ...current.recentVerifiedSubjects])].slice(0, 6)
+      : current.recentVerifiedSubjects
+  };
+}
+
+export function requiresReferenceClarification(
+  text: string,
+  state?: TopicState,
+  messages: ContextMessage[] = []
+): boolean {
+  if (isConversationOnlyIntent(text) || !isContextualFollowUp(text)) return false;
+  const explicit = explicitSubjectFrom(text);
+  if (explicit.subject) return false;
+  if (OTHER_ONE_COMMAND.test(text) && resolveOtherOne(messages)) return false;
+  return !normalizeTopicState(state).currentExplicitSubject;
 }
 
 export function topicTerms(state?: TopicState): string[] {
-  if (!state) return [];
-  const values = state.entities.length ? state.entities : [state.topic];
+  const current = normalizeTopicState(state);
+  const values = current.currentExplicitSubject
+    ? [current.currentExplicitSubject]
+    : current.recentEntities;
   return [...new Set(values
     .flatMap(value => value.toLowerCase().split(/[^a-z0-9]+/i))
     .filter(value => value.length >= 3 && !["the", "and", "with", "versus"].includes(value)))];
@@ -314,7 +453,7 @@ export function resolveContextualQuery(messages: ContextMessage[], topicState?: 
     }
   }
   if (currentIndex < 0) return "";
-  const original = trimQuery(messages[currentIndex].content);
+  const original = trimQuery(externalQueryText(messages[currentIndex].content));
   if (!original || isConversationOnlyIntent(original)) return original;
   if (!isContextualFollowUp(original)) return exactCurrentProductQuery(original);
 
@@ -326,13 +465,14 @@ export function resolveContextualQuery(messages: ContextMessage[], topicState?: 
     return other || original;
   }
 
-  const topic = topicState?.topic || bestRecentTopic(prior);
+  const state = normalizeTopicState(topicState);
+  const topic = state.currentExplicitSubject;
   if (!topic) return original;
   const previousUser = [...prior].reverse().find(message => message.role === "user");
   const previousFocus = previousUser ? focusFrom(previousUser.content) : "";
 
   if (RESEARCH_COMMAND.test(original)) {
-    return trimQuery([topic, topicState?.focus || previousFocus, researchSuffix(prior)].filter(Boolean).join(" "));
+    return trimQuery([topic, state.focus || previousFocus, researchSuffix(topic)].filter(Boolean).join(" "));
   }
 
   if (VERIFY_COMMAND.test(original)) {
@@ -346,6 +486,8 @@ export function resolveContextualQuery(messages: ContextMessage[], topicState?: 
   }
 
   if (/\bhow old\b/i.test(original)) return `How old is ${topic}?`;
+
+  if (/^which(?:\s+one)?[!?. ]*$/i.test(original)) return trimQuery(`${topic} exact model`);
 
   if (/^(?:why|how)[?!]*$/i.test(original)) {
     const claim = lastAssistantClaim(prior);
