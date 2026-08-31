@@ -448,7 +448,7 @@ button:focus-visible, textarea:focus-visible, input:focus-visible {
   display: grid;
   grid-template-columns: 38px minmax(0, 1fr);
   gap: 15px;
-  padding: 20px 0 25px;
+  padding: 17px 0 22px;
   border-bottom: 1px solid #141415;
   animation: message-in 180ms ease both;
 }
@@ -458,7 +458,7 @@ button:focus-visible, textarea:focus-visible, input:focus-visible {
   width: min(410px, 72%);
   grid-template-columns: minmax(0, 1fr) 34px;
   margin-left: auto;
-  padding: 18px 0 24px;
+  padding: 16px 0 21px;
 }
 .message.user .message-identity { grid-column: 2; grid-row: 1; }
 .message.user .message-content { grid-column: 1; grid-row: 1; padding: 14px 16px; border: 1px solid #1d1d1f; border-radius: 18px 5px 18px 18px; background: linear-gradient(145deg, #181819, #141415); }
@@ -555,9 +555,12 @@ button:focus-visible, textarea:focus-visible, input:focus-visible {
 .you-mark { color: #888883; font-family: "Cascadia Mono", Consolas, monospace; font-size: 8px; font-weight: 700; letter-spacing: .04em; }
 .message-content { min-width: 0; }
 .message-meta { height: 18px; display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
-.message-meta > span { color: #bdbdb8; font-family: "Cascadia Mono", Consolas, monospace; font-size: 9px; font-weight: 700; letter-spacing: .09em; }
+.message-author { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.message-author > span { color: #bdbdb8; font-family: "Cascadia Mono", Consolas, monospace; font-size: 9px; font-weight: 700; letter-spacing: .09em; }
+.message-author > small { color: #595954; font-family: "Cascadia Mono", Consolas, monospace; font-size: 7.5px; letter-spacing: .035em; animation: work-status-in 150ms ease both; }
+@keyframes work-status-in { from { opacity: 0; transform: translateX(-2px); } }
 .message.user .message-meta { margin-bottom: 6px; }
-.message.user .message-meta > span { color: #6f6f6b; }
+.message.user .message-author > span { color: #6f6f6b; }
 .route-labels { display: flex; gap: 5px; }
 .route-labels em {
   height: 18px;
@@ -576,6 +579,7 @@ button:focus-visible, textarea:focus-visible, input:focus-visible {
 }
 .route-labels em.web { color: #ef6b67; border-color: #3a1e1d; background: #140c0c; }
 .route-labels em.vision { color: #b0b0aa; border-color: #363638; }
+.route-labels em.context { color: #a9a9a3; border-color: #343436; background: #121213; }
 .message-text { color: #d9d9d5; font-size: 12.5px; line-height: 1.58; white-space: pre-wrap; overflow-wrap: anywhere; }
 .message.user .message-text { color: #c1c1bc; font-size: 12px; line-height: 1.5; }
 .message.error .message-content { padding: 13px 14px; border: 1px solid #38201f; border-radius: 10px; background: #130d0d; }
@@ -671,17 +675,22 @@ button:focus-visible, textarea:focus-visible, input:focus-visible {
   z-index: 3;
   left: 50%;
   bottom: 104px;
-  width: 34px;
+  width: auto;
+  min-width: 34px;
   height: 34px;
-  display: grid;
-  place-items: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 11px;
   border: 1px solid #2b2b2d;
-  border-radius: 50%;
+  border-radius: 17px;
   background: #171718;
   color: #aaa9a4;
   box-shadow: 0 8px 24px rgba(0, 0, 0, .45);
   cursor: pointer;
 }
+.scroll-bottom span { font-family: "Cascadia Mono", Consolas, monospace; font-size: 7px; font-weight: 700; letter-spacing: .09em; }
 .scroll-bottom:hover { background: #222224; color: #fff; }
 
 .composer-zone {

@@ -193,7 +193,8 @@ function predictedRoute(text: string, hasVision: boolean, forceWeb: boolean, con
   return "local";
 }
 
-function routeLabels(route?: Route): string[] {
+function routeLabels(route?: Route, contextReused = false): string[] {
+  if (contextReused) return ["CONTEXT"];
   if (!route || route === "local") return ["LOCAL"];
   if (route === "vision+web") return ["VISION", "WEB"];
   return [route.toUpperCase()];
@@ -291,12 +292,13 @@ function App() {
   const [maximized, setMaximized] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [composerNotice, setComposerNotice] = useState("");
-  const [appVersion, setAppVersion] = useState("0.5.5");
+  const [appVersion, setAppVersion] = useState("0.5.6");
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("idle");
   const [updateInfo, setUpdateInfo] = useState<NthUpdateInfo | null>(null);
   const [updateMessage, setUpdateMessage] = useState("NTH checks the signed release channel automatically.");
   const [updatePercent, setUpdatePercent] = useState<number | null>(null);
   const [avatarNotice, setAvatarNotice] = useState("");
+  const [expandedSources, setExpandedSources] = useState<Record<string, boolean>>({});
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const avatarInputRef = useRef<HTMLInputElement | null>(null);
@@ -608,7 +610,7 @@ function App() {
     setInput("");
     setAttachments([]);
     setBusy(true);
-    setPhase(route.includes("web") ? "searching" : "generating");
+    setPhase(null);
     setAtBottom(true);
     const controller = new AbortController();
     generationRef.current = controller;
@@ -617,10 +619,19 @@ function App() {
       const result = await answerNth({
         messages: requestMessages
           .filter(message => !message.error)
-          .map(({ role, content, attachments: images }) => ({ role, content, attachments: images })),
+          .map(({ role, content, attachments: images, route: messageRoute, sources, searchQuery, contextReused }) => ({
+            role,
+            content,
+            attachments: images,
+            route: messageRoute,
+            sources,
+            searchQuery,
+            contextReused
+          })),
         mode,
         forceWeb: webForced,
         web: { searxngUrl: settings.searxngUrl },
+        topicState: activeConversation.context,
         signal: controller.signal,
         onPhase: nextPhase => setPhase(nextPhase),
         onToken: token => {
@@ -636,10 +647,19 @@ function App() {
 
       updateConversation(conversationId, conversation => ({
         ...conversation,
+        context: result.topicState,
         updatedAt: Date.now(),
         messages: conversation.messages.map(message =>
           message.id === assistantId
-            ? { ...message, content: result.content, route: result.route, sources: result.sources, streaming: false }
+            ? {
+                ...message,
+                content: result.content,
+                route: result.route,
+                sources: result.sources,
+                searchQuery: result.searchQuery,
+                contextReused: result.contextReused,
+                streaming: false
+              }
             : message
         )
       }));
@@ -730,10 +750,12 @@ function App() {
   }
 
   const phaseLabel = phase === "searching"
-    ? "Searching trusted sources"
+    ? "Searching web…"
     : phase === "verifying"
-      ? "Verifying evidence"
-      : "Generating locally";
+      ? "Checking sources…"
+      : phase === "generating"
+        ? "Answering…"
+        : "Thinking…";
 
   return (
     <div
@@ -861,9 +883,14 @@ function App() {
                     </div>
                     <div className="message-content">
                       <div className="message-meta">
-                        <span>{message.role === "assistant" ? "NTH." : "YOU"}</span>
+                        <div className="message-author">
+                          <span>{message.role === "assistant" ? "NTH." : "YOU"}</span>
+                          {message.role === "assistant" && message.streaming ? (
+                            <small>{phaseLabel}</small>
+                          ) : null}
+                        </div>
                         <div className="route-labels">
-                          {message.role === "assistant" && routeLabels(message.route).map(label => (
+                          {message.role === "assistant" && !message.streaming && routeLabels(message.route, message.contextReused).map(label => (
                             <em className={label.toLowerCase()} key={label}>{label}</em>
                           ))}
                         </div>
@@ -882,7 +909,14 @@ function App() {
                         {message.streaming && message.content && <span className="stream-cursor" />}
                       </div>
 
-                      {message.sources?.length ? <SourceCards sources={message.sources} onOpen={openSource} /> : null}
+                      {message.sources?.length ? (
+                        <SourceCards
+                          sources={message.sources}
+                          expanded={Boolean(expandedSources[message.id])}
+                          onToggle={() => setExpandedSources(current => ({ ...current, [message.id]: !current[message.id] }))}
+                          onOpen={openSource}
+                        />
+                      ) : null}
 
                       {message.role === "assistant" && message.content && !message.streaming && !message.error ? (
                         <div className="message-actions">
@@ -906,6 +940,7 @@ function App() {
               aria-label="Scroll to latest message"
             >
               <ArrowDown size={16} />
+              <span>LATEST</span>
             </button>
           )}
 
@@ -956,7 +991,7 @@ function App() {
                 title={webForced ? "Web search is on" : autoWeb ? "Web search will turn on automatically" : "Use web search"}
               >
                 <Search size={14} />
-                <span>WEB</span>
+                <span>{webForced ? "WEB ON" : autoWeb ? "AUTO WEB" : "WEB"}</span>
                 <i />
               </button>
               {busy ? (
@@ -1115,19 +1150,27 @@ function App() {
   );
 }
 
-function SourceCards({ sources, onOpen }: { sources: SearchSource[]; onOpen: (url: string) => Promise<void> }) {
-  const [expanded, setExpanded] = useState(false);
-
+function SourceCards({
+  sources,
+  expanded,
+  onToggle,
+  onOpen
+}: {
+  sources: SearchSource[];
+  expanded: boolean;
+  onToggle: () => void;
+  onOpen: (url: string) => Promise<void>;
+}) {
   return (
     <section className={`source-section ${expanded ? "expanded" : ""}`}>
-      <button className="source-toggle" onClick={() => setExpanded(current => !current)} aria-expanded={expanded}>
+      <button className="source-toggle" onClick={onToggle} aria-expanded={expanded}>
         <Globe2 size={13} />
         <span>SOURCES <i>·</i> {sources.length} verified results</span>
         <ChevronDown size={13} />
       </button>
       <div className="source-collapse" aria-hidden={!expanded}>
         <div className="source-grid">
-          {sources.slice(0, 6).map((source, index) => (
+          {sources.slice(0, 10).map((source, index) => (
             <button key={source.url} onClick={() => void onOpen(source.url)} className="source-card">
               <span className="source-index">{String(index + 1).padStart(2, "0")}</span>
               <span className="source-copy">

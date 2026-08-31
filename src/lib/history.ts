@@ -1,10 +1,13 @@
 import type { NthMessage, Route, SearchSource } from "./nth";
+import type { TopicState } from "./context";
 
 export type UiMessage = NthMessage & {
   id: string;
   createdAt: number;
   route?: Route;
   sources?: SearchSource[];
+  searchQuery?: string;
+  contextReused?: boolean;
   error?: boolean;
   streaming?: boolean;
 };
@@ -15,6 +18,7 @@ export type Conversation = {
   createdAt: number;
   updatedAt: number;
   messages: UiMessage[];
+  context?: TopicState;
 };
 
 export type ConversationGroup = {

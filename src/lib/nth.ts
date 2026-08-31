@@ -1,10 +1,17 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { NTH_POLICY_V2 } from "./policy";
 import {
+  calculateAge,
+  decomposePrompt,
+  deriveTopicState,
+  isContextualFollowUp,
+  isConversationOnlyIntent,
   needsFreshWeb,
   recentAnswerContext,
   resolveContextualQuery,
-  type ContextMessage
+  topicTerms,
+  type ContextMessage,
+  type TopicState
 } from "./context";
 
 export type NthMode = "RUN" | "JOG" | "WALK";
@@ -26,6 +33,10 @@ export type NthMessage = {
   role: "user" | "assistant";
   content: string;
   attachments?: Attachment[];
+  route?: Route;
+  sources?: SearchSource[];
+  searchQuery?: string;
+  contextReused?: boolean;
 };
 
 export type SearchSource = {
@@ -51,6 +62,9 @@ export type NthAnswer = {
   content: string;
   route: Route;
   sources: SearchSource[];
+  searchQuery?: string;
+  contextReused: boolean;
+  topicState: TopicState;
 };
 
 export type AnswerPhase = "searching" | "generating" | "verifying";
@@ -116,6 +130,27 @@ WEB EVIDENCE:
 ${evidence}`;
 }
 
+function verifiedContextPolicy(evidence: string, searchQuery: string): string {
+  return `${NTH_POLICY_V2}
+
+VERIFIED RECENT CONTEXT MODE:
+The answer can be produced from verified evidence already present in this conversation. No new web search was performed.
+
+CURRENT LOCAL DATE: ${localDateString()}
+RESOLVED CONTEXT: ${searchQuery}
+
+RULES:
+- Answer the visible user message naturally using recent USER and NTH turns.
+- Treat the year in CURRENT LOCAL DATE as the present year, never as a future year.
+- Use only the verified recent evidence below for externally verifiable claims.
+- Do not imply that a new web search occurred.
+- If the evidence is insufficient, say so instead of inventing a referent or fact.
+- Keep NTH's normal concise style.
+
+VERIFIED RECENT EVIDENCE:
+${evidence}`;
+}
+
 function shouldVerifyWeb(intent: string): boolean {
   return ["current_product", "latest_news", "price", "rumor"].includes(intent);
 }
@@ -148,6 +183,122 @@ ${evidence}`;
 
 function abortError(): DOMException {
   return new DOMException("Generation stopped.", "AbortError");
+}
+
+type SearchBundle = {
+  query: string;
+  intent: string;
+  search_queries: string[];
+  sources: SearchSource[];
+  evidence: string;
+  engine_warnings: string[];
+};
+
+export type AgeFact = {
+  subject: string;
+  dateOfBirth: string;
+  age: number;
+  asOf: string;
+};
+
+const MONTHS: Record<string, number> = {
+  january: 1, february: 2, march: 3, april: 4, may: 5, june: 6,
+  july: 7, august: 8, september: 9, october: 10, november: 11, december: 12
+};
+
+function parseBirthDate(text: string): string | null {
+  const labeled = text.match(/(?:born|date of birth|birth date|birthday)\s*(?::|was|is|on)?\s*(\d{4})-(\d{1,2})-(\d{1,2})/i);
+  if (labeled) return `${labeled[1]}-${String(Number(labeled[2])).padStart(2, "0")}-${String(Number(labeled[3])).padStart(2, "0")}`;
+
+  const monthFirst = text.match(/(?:born|date of birth|birth date|birthday)\s*(?::|was|is|on)?\s*(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})/i);
+  if (monthFirst) return `${monthFirst[3]}-${String(MONTHS[monthFirst[1].toLowerCase()]).padStart(2, "0")}-${String(Number(monthFirst[2])).padStart(2, "0")}`;
+
+  const dayFirst = text.match(/(?:born|date of birth|birth date|birthday)\s*(?::|was|is|on)?\s*(\d{1,2})(?:st|nd|rd|th)?\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})/i);
+  if (dayFirst) return `${dayFirst[3]}-${String(MONTHS[dayFirst[2].toLowerCase()]).padStart(2, "0")}-${String(Number(dayFirst[1])).padStart(2, "0")}`;
+  return null;
+}
+
+function ageFactsFromSources(sources: SearchSource[], state: TopicState, now = new Date()): AgeFact[] {
+  const subjects = state.entities.length ? state.entities : state.topic ? [state.topic] : [];
+  const facts: AgeFact[] = [];
+  for (const source of sources) {
+    const text = `${source.title}. ${source.snippet}. ${source.content || ""}`;
+    const dateOfBirth = parseBirthDate(text);
+    if (!dateOfBirth) continue;
+    const age = calculateAge(dateOfBirth, now);
+    if (age === null) continue;
+    const subject = subjects.find(entity => text.toLowerCase().includes(entity.toLowerCase()))
+      || (subjects.length === 1 ? subjects[0] : "");
+    if (!subject || facts.some(fact => fact.subject.toLowerCase() === subject.toLowerCase())) continue;
+    facts.push({ subject, dateOfBirth, age, asOf: localDateString() });
+  }
+  return facts;
+}
+
+function ageGrounding(sources: SearchSource[], state: TopicState): string {
+  const asksAge = state.focus === "age" || /\b(?:how old|age|older|youngest)\b/i.test(state.topic);
+  if (!asksAge) return "";
+  const facts = ageFactsFromSources(sources, state);
+  if (!facts.length) {
+    return `\n\nDETERMINISTIC AGE RULE:\nNo supported date of birth could be extracted. Do not provide an exact current age from model memory or a stale snippet age.`;
+  }
+  return `\n\nDETERMINISTIC AGE CALCULATION (authoritative for this answer):\n${facts.map(fact => `- ${fact.subject}: born ${fact.dateOfBirth}; age ${fact.age} on ${fact.asOf}.`).join("\n")}\nUse these calculated ages. Do not copy a stale age number from a snippet or model memory.`;
+}
+
+function verifiedEvidenceFrom(messages: NthMessage[]): { sources: SearchSource[]; evidence: string } | null {
+  const recent = [...messages].reverse().filter(message =>
+    message.role === "assistant" && Boolean(message.sources?.length) && Boolean(message.content.trim())
+  ).slice(0, 3);
+  if (!recent.length) return null;
+  const sources = uniqueSources(recent.map(message => ({
+    query: message.searchQuery || "recent verified context",
+    intent: "general_fresh",
+    search_queries: [],
+    sources: message.sources || [],
+    evidence: "",
+    engine_warnings: []
+  })));
+  const evidence = [
+    ...recent.map((message, index) => `RECENT VERIFIED NTH ANSWER ${index + 1}:\n${message.content}`),
+    ...sources.map((source, index) => `[${index + 1}] ${source.title}\n${source.snippet}\n${source.domain}`)
+  ].join("\n\n");
+  return { sources, evidence };
+}
+
+function canReuseVerifiedContext(text: string, query: string, state: TopicState, evidence: string): boolean {
+  if (!isContextualFollowUp(text) || isConversationOnlyIntent(text)) return false;
+  if (/\b(?:research|look|dig)\s+(?:deeper|further)|\bverify\b|fact[- ]?check|is (?:that|this|it) true/i.test(text)) return false;
+  const haystack = evidence.toLowerCase();
+  const terms = topicTerms(state);
+  if (terms.length && !terms.some(term => haystack.includes(term))) return false;
+  if (/\b(?:power|watt|tdp)\b/i.test(query) && !/\b(?:power|watt|tdp)\b/i.test(evidence)) return false;
+  if (/\b(?:price|cost|how much)\b/i.test(query) && !/\b(?:price|cost|\$|€|£)\b/i.test(evidence)) return false;
+  if (/\b(?:older|how old|age)\b/i.test(query) && !/\b(?:born|birth|age|years? old)\b/i.test(evidence)) return false;
+  if (/\bolder\b/i.test(query) && state.entities.length > 1) {
+    if (!state.entities.slice(0, 2).every(entity => haystack.includes(entity.toLowerCase()))) return false;
+  }
+  if (state.focus === "performance" && !/\b(?:performance|benchmark|fps|score|faster|slower)\b/i.test(evidence)) return false;
+  if (state.focus === "availability" && !/\b(?:available|availability|stock|released|shipping)\b/i.test(evidence)) return false;
+  if (
+    state.focus
+    && !["age", "power consumption", "price", "performance", "availability"].includes(state.focus)
+    && !haystack.includes(state.focus.toLowerCase())
+  ) return false;
+  return /^(?:which(?: one)?|who is older|why|how)[!?. ]*$/i.test(text.trim())
+    || /\b(?:he|she|it|they|this|that|other one)\b/i.test(text)
+    || terms.some(term => haystack.includes(term));
+}
+
+function uniqueSources(bundles: SearchBundle[], maximum = 10): SearchSource[] {
+  const seen = new Set<string>();
+  const result: SearchSource[] = [];
+  for (const source of bundles.flatMap(bundle => bundle.sources)) {
+    if (!source.url || seen.has(source.url)) continue;
+    seen.add(source.url);
+    result.push(source);
+    if (result.length >= maximum) break;
+  }
+  return result;
 }
 
 async function streamOllamaChat(args: {
@@ -198,11 +349,12 @@ export async function answerNth(args: {
   mode: NthMode;
   forceWeb: boolean;
   web: WebSettings;
+  topicState?: TopicState;
   signal?: AbortSignal;
   onToken?: (token: string) => void;
   onPhase?: (phase: AnswerPhase) => void;
 }): Promise<NthAnswer> {
-  const { messages, mode, forceWeb, web, signal, onToken, onPhase } = args;
+  const { messages, mode, forceWeb, web, topicState: previousTopicState, signal, onToken, onPhase } = args;
   let lastUserIndex = -1;
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     if (messages[index].role === "user") {
@@ -214,34 +366,73 @@ export async function answerNth(args: {
   const text = lastUser?.content ?? "";
   const hasVision = Boolean(lastUser?.attachments?.length);
   const priorMessages = lastUserIndex >= 0 ? messages.slice(0, lastUserIndex) : messages;
-  const useWeb = forceWeb || needsWeb(text, priorMessages);
-  const searchQuery = useWeb ? resolveContextualQuery(messages) || text : text;
+  const nextTopicState = deriveTopicState(messages, previousTopicState);
+  const parts = decomposePrompt(text, 5);
+  const subquestions = parts.length ? parts : [text];
+  const baseSearchRequests = subquestions.flatMap(part => {
+    const partMessages = subquestions.length === 1
+      ? messages
+      : [...priorMessages, { role: "user" as const, content: part }];
+    const resolved = resolveContextualQuery(partMessages, nextTopicState) || part;
+    const requiresWeb = forceWeb || needsWeb(part, priorMessages);
+    return requiresWeb ? [{ question: part, query: resolved }] : [];
+  });
+  const searchRequests = baseSearchRequests.length === 1
+    && !isContextualFollowUp(text)
+    && nextTopicState.focus === "age"
+    && nextTopicState.entities.length > 1
+    ? nextTopicState.entities.slice(0, 4).map(entity => ({
+        question: baseSearchRequests[0].question,
+        query: `${entity} date of birth age of ${entity}`
+      }))
+    : baseSearchRequests.map(request => ({
+        ...request,
+        query: nextTopicState.focus === "age" && !/\b(?:how old|age of|date of birth)\b/i.test(request.query)
+          ? `${request.query} date of birth age of each person`
+          : request.query
+      }));
+  const resolvedQuery = searchRequests.map(request => request.query).join(" | ") || text;
   const generationId = crypto.randomUUID();
 
   let sources: SearchSource[] = [];
   let policy = NTH_POLICY_V2;
   let evidence = "";
   let intent = "";
+  let contextReused = false;
 
-  if (useWeb) {
+  const recentVerified = !forceWeb && searchRequests.length === 1
+    ? verifiedEvidenceFrom(priorMessages)
+    : null;
+  if (
+    recentVerified
+    && canReuseVerifiedContext(text, searchRequests[0].query, nextTopicState, recentVerified.evidence)
+  ) {
+    contextReused = true;
+    sources = recentVerified.sources;
+    evidence = recentVerified.evidence;
+    policy = verifiedContextPolicy(evidence, searchRequests[0].query)
+      + ageGrounding(sources, nextTopicState);
+  }
+
+  if (searchRequests.length && !contextReused) {
     onPhase?.("searching");
-    const bundle = await invoke<{
-      query: string;
-      intent: string;
-      search_queries: string[];
-      sources: SearchSource[];
-      evidence: string;
-      engine_warnings: string[];
-    }>("searxng_smart_search", {
-      query: searchQuery,
+    const bundles = await Promise.all(searchRequests.map(request => invoke<SearchBundle>("searxng_smart_search", {
+      query: request.query,
       searxngUrl: web.searxngUrl,
       maxSources: 6
-    });
+    })));
 
-    sources = bundle.sources;
-    evidence = bundle.evidence;
-    intent = bundle.intent;
-    policy = webPolicy(evidence, intent, searchQuery);
+    sources = uniqueSources(bundles);
+    evidence = bundles.map((bundle, index) => [
+      `SUBQUESTION ${index + 1}: ${searchRequests[index].question}`,
+      `RESOLVED QUERY: ${searchRequests[index].query}`,
+      bundle.evidence
+    ].join("\n")).join("\n\n");
+    intent = bundles.find(bundle => shouldVerifyWeb(bundle.intent))?.intent || bundles[0]?.intent || "general_fresh";
+    const orderingRule = subquestions.length > 1
+      ? "\n- Answer every subquestion in the user's original order. Keep the numbering/order clear."
+      : "";
+    policy = webPolicy(evidence, intent, resolvedQuery) + orderingRule + ageGrounding(sources, nextTopicState);
   }
 
   if (signal?.aborted) throw abortError();
@@ -269,14 +460,14 @@ export async function answerNth(args: {
 
   // Evidence verification is useful here because the second pass checks supplied
   // web evidence, not the model's own stale memory. It only runs for risky web intents.
-  if (useWeb && shouldVerifyWeb(intent)) {
+  if (searchRequests.length && !contextReused && shouldVerifyWeb(intent)) {
     onPhase?.("verifying");
     const verified = await streamOllamaChat({
       model: MODEL_BY_MODE[mode],
       policy: webVerifierPolicy(evidence, intent),
       messages: [{
         role: "user",
-        content: `USER QUESTION:\n${text}\n\nRESOLVED SEARCH CONTEXT:\n${searchQuery}\n\nDRAFT ANSWER:\n${finalContent}`,
+        content: `USER QUESTION:\n${text}\n\nRESOLVED SEARCH CONTEXT:\n${resolvedQuery}\n\nDRAFT ANSWER:\n${finalContent}`,
         images: []
       }],
       maxTokens: 256,
@@ -290,14 +481,17 @@ export async function answerNth(args: {
   }
 
   const route: Route =
-    hasVision && useWeb ? "vision+web" :
+    hasVision && searchRequests.length && !contextReused ? "vision+web" :
     hasVision ? "vision" :
-    useWeb ? "web" :
+    searchRequests.length && !contextReused ? "web" :
     "local";
 
   return {
     content: finalContent,
     route,
-    sources
+    sources,
+    searchQuery: searchRequests.length ? resolvedQuery : undefined,
+    contextReused,
+    topicState: nextTopicState
   };
 }
