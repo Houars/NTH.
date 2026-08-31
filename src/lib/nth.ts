@@ -1,5 +1,11 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { NTH_POLICY_V2 } from "./policy";
+import {
+  needsFreshWeb,
+  recentAnswerContext,
+  resolveContextualQuery,
+  type ContextMessage
+} from "./context";
 
 export type NthMode = "RUN" | "JOG" | "WALK";
 
@@ -58,17 +64,8 @@ export type WebSettings = {
   searxngUrl: string;
 };
 
-const FRESHNESS_PATTERNS = [
-  /\b(latest|newest|current|currently|today|tonight|this week|this month|recent|recently)\b/i,
-  /\b(price|cost|worth|stock|available|availability|release date|released|launch|version)\b/i,
-  /\b(news|weather|forecast|schedule|score|standings|election|president|ceo)\b/i,
-  /\bhow old is\b/i,
-  /\bwhat(?:'s| is) the newest\b/i,
-  /\bwhat(?:'s| is) the latest\b/i
-];
-
-export function needsWeb(text: string): boolean {
-  return FRESHNESS_PATTERNS.some(pattern => pattern.test(text));
+export function needsWeb(text: string, recentMessages: ContextMessage[] = []): boolean {
+  return needsFreshWeb(text, recentMessages);
 }
 
 export async function pingOllama(): Promise<boolean> {
@@ -88,7 +85,7 @@ function localDateString(): string {
   return `${y}-${m}-${day}`;
 }
 
-function webPolicy(evidence: string, intent: string): string {
+function webPolicy(evidence: string, intent: string, searchQuery: string): string {
   return `${NTH_POLICY_V2}
 
 WEB MODE:
@@ -96,8 +93,10 @@ The question requires current or externally verified information.
 
 CURRENT LOCAL DATE: ${localDateString()}
 SEARCH INTENT: ${intent}
+RESOLVED SEARCH CONTEXT: ${searchQuery}
 
 STRICT WEB RULES:
+- Treat the year in CURRENT LOCAL DATE as the present year, never as a future year.
 - Use the supplied web evidence instead of stale model memory for current facts.
 - Answer the exact thing the user asked for. Preserve granularity.
 - If the user asks for a GPU/phone/device/model, give a specific currently released model ONLY when a title/snippet explicitly supports that exact model.
@@ -204,10 +203,19 @@ export async function answerNth(args: {
   onPhase?: (phase: AnswerPhase) => void;
 }): Promise<NthAnswer> {
   const { messages, mode, forceWeb, web, signal, onToken, onPhase } = args;
-  const lastUser = [...messages].reverse().find(m => m.role === "user");
+  let lastUserIndex = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index].role === "user") {
+      lastUserIndex = index;
+      break;
+    }
+  }
+  const lastUser = lastUserIndex >= 0 ? messages[lastUserIndex] : undefined;
   const text = lastUser?.content ?? "";
   const hasVision = Boolean(lastUser?.attachments?.length);
-  const useWeb = forceWeb || needsWeb(text);
+  const priorMessages = lastUserIndex >= 0 ? messages.slice(0, lastUserIndex) : messages;
+  const useWeb = forceWeb || needsWeb(text, priorMessages);
+  const searchQuery = useWeb ? resolveContextualQuery(messages) || text : text;
   const generationId = crypto.randomUUID();
 
   let sources: SearchSource[] = [];
@@ -225,7 +233,7 @@ export async function answerNth(args: {
       evidence: string;
       engine_warnings: string[];
     }>("searxng_smart_search", {
-      query: text,
+      query: searchQuery,
       searxngUrl: web.searxngUrl,
       maxSources: 6
     });
@@ -233,12 +241,12 @@ export async function answerNth(args: {
     sources = bundle.sources;
     evidence = bundle.evidence;
     intent = bundle.intent;
-    policy = webPolicy(evidence, intent);
+    policy = webPolicy(evidence, intent, searchQuery);
   }
 
   if (signal?.aborted) throw abortError();
 
-  const apiMessages = messages.map(message => ({
+  const apiMessages = recentAnswerContext(messages).map(message => ({
     role: message.role,
     content: message.content,
     images: (message.attachments ?? [])
@@ -268,7 +276,7 @@ export async function answerNth(args: {
       policy: webVerifierPolicy(evidence, intent),
       messages: [{
         role: "user",
-        content: `USER QUESTION:\n${text}\n\nDRAFT ANSWER:\n${finalContent}`,
+        content: `USER QUESTION:\n${text}\n\nRESOLVED SEARCH CONTEXT:\n${searchQuery}\n\nDRAFT ANSWER:\n${finalContent}`,
         images: []
       }],
       maxTokens: 256,

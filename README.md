@@ -13,6 +13,8 @@ Rust, and Ollama.
 - RUN / JOG / WALK modes, ready for separate model IDs later
 - Local profile avatar with crop, preview, replacement, and removal
 - Animated monochrome NTH Glyph Matrix with response-state signals
+- Recent-turn contextual follow-ups with date-aware automatic WEB routing
+- Collapsed-by-default verified source cards
 - In-app settings and service status without developer-facing error dumps
 
 ## Protected AI behavior

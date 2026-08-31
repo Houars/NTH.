@@ -12,6 +12,7 @@ import {
   ArrowDown,
   Camera,
   Check,
+  ChevronDown,
   CircleStop,
   Copy,
   Download,
@@ -184,8 +185,8 @@ function friendlyError(error: unknown): string {
   return "NTH could not finish that response. Please try again.";
 }
 
-function predictedRoute(text: string, hasVision: boolean, forceWeb: boolean): Route {
-  const useWeb = forceWeb || needsWeb(text);
+function predictedRoute(text: string, hasVision: boolean, forceWeb: boolean, context: UiMessage[] = []): Route {
+  const useWeb = forceWeb || needsWeb(text, context);
   if (hasVision && useWeb) return "vision+web";
   if (hasVision) return "vision";
   if (useWeb) return "web";
@@ -290,7 +291,7 @@ function App() {
   const [maximized, setMaximized] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [composerNotice, setComposerNotice] = useState("");
-  const [appVersion, setAppVersion] = useState("0.5.4");
+  const [appVersion, setAppVersion] = useState("0.5.5");
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("idle");
   const [updateInfo, setUpdateInfo] = useState<NthUpdateInfo | null>(null);
   const [updateMessage, setUpdateMessage] = useState("NTH checks the signed release channel automatically.");
@@ -310,7 +311,7 @@ function App() {
   );
   const messages = activeConversation?.messages || [];
   const groups = useMemo(() => groupConversations(conversations), [conversations]);
-  const autoWeb = needsWeb(input);
+  const autoWeb = needsWeb(input, messages);
   const canSend = ready && !busy && Boolean(input.trim() || attachments.length);
 
   async function chooseAvatar(file?: File) {
@@ -341,6 +342,12 @@ function App() {
   useEffect(() => {
     localStorage.setItem(MODE_KEY, mode);
   }, [mode]);
+
+  useEffect(() => {
+    const disableBrowserMenu = (event: MouseEvent) => event.preventDefault();
+    window.addEventListener("contextmenu", disableBrowserMenu);
+    return () => window.removeEventListener("contextmenu", disableBrowserMenu);
+  }, []);
 
   useEffect(() => {
     const inTauri = Boolean((window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__);
@@ -579,7 +586,7 @@ function App() {
       createdAt: Date.now()
     };
     const assistantId = crypto.randomUUID();
-    const route = predictedRoute(text, Boolean(sentAttachments.length), webForced);
+    const route = predictedRoute(text, Boolean(sentAttachments.length), webForced, messages);
     const assistantMessage: UiMessage = {
       id: assistantId,
       role: "assistant",
@@ -1109,20 +1116,28 @@ function App() {
 }
 
 function SourceCards({ sources, onOpen }: { sources: SearchSource[]; onOpen: (url: string) => Promise<void> }) {
+  const [expanded, setExpanded] = useState(false);
+
   return (
-    <section className="source-section">
-      <div className="source-heading"><Globe2 size={13} /><span>SOURCES</span><small>{sources.length} verified results</small></div>
-      <div className="source-grid">
-        {sources.slice(0, 6).map((source, index) => (
-          <button key={source.url} onClick={() => void onOpen(source.url)} className="source-card">
-            <span className="source-index">{String(index + 1).padStart(2, "0")}</span>
-            <span className="source-copy">
-              <strong>{source.title}</strong>
-              <small>{source.domain}{source.official ? <em>OFFICIAL</em> : null}</small>
-            </span>
-            <ExternalLink size={12} />
-          </button>
-        ))}
+    <section className={`source-section ${expanded ? "expanded" : ""}`}>
+      <button className="source-toggle" onClick={() => setExpanded(current => !current)} aria-expanded={expanded}>
+        <Globe2 size={13} />
+        <span>SOURCES <i>·</i> {sources.length} verified results</span>
+        <ChevronDown size={13} />
+      </button>
+      <div className="source-collapse" aria-hidden={!expanded}>
+        <div className="source-grid">
+          {sources.slice(0, 6).map((source, index) => (
+            <button key={source.url} onClick={() => void onOpen(source.url)} className="source-card">
+              <span className="source-index">{String(index + 1).padStart(2, "0")}</span>
+              <span className="source-copy">
+                <strong>{source.title}</strong>
+                <small>{source.domain}{source.official ? <em>OFFICIAL</em> : null}</small>
+              </span>
+              <ExternalLink size={12} />
+            </button>
+          ))}
+        </div>
       </div>
     </section>
   );

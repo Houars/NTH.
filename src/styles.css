@@ -606,10 +606,44 @@ button:focus-visible, textarea:focus-visible, input:focus-visible {
 .message-actions button:hover { color: #aaa9a4; background: #121213; }
 
 .source-section { margin-top: 17px; }
-.source-heading { display: flex; align-items: center; gap: 7px; margin-bottom: 8px; color: #686863; }
-.source-heading span { font-family: "Cascadia Mono", Consolas, monospace; font-size: 8px; font-weight: 700; letter-spacing: .1em; }
-.source-heading small { margin-left: auto; color: #464642; font-size: 8px; }
+.source-toggle {
+  width: 100%;
+  height: 31px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 9px;
+  border: 1px solid #1d1d1f;
+  border-radius: 9px;
+  background: #0c0c0d;
+  color: #62625d;
+  cursor: pointer;
+  transition: border-color 150ms ease, background 150ms ease, color 150ms ease;
+}
+.source-toggle:hover { border-color: #2c2c2e; background: #101011; color: #969690; }
+.source-toggle span { font-family: "Cascadia Mono", Consolas, monospace; font-size: 8px; font-weight: 700; letter-spacing: .075em; }
+.source-toggle span i { color: #3e3e3a; font-style: normal; }
+.source-toggle > svg:last-child { margin-left: auto; transition: transform 170ms ease; }
+.source-section.expanded .source-toggle > svg:last-child { transform: rotate(180deg); }
+.source-collapse {
+  display: grid;
+  grid-template-rows: 0fr;
+  margin-top: 0;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: grid-template-rows 180ms ease, margin-top 180ms ease, opacity 140ms ease, visibility 0s linear 180ms;
+}
+.source-section.expanded .source-collapse {
+  grid-template-rows: 1fr;
+  margin-top: 8px;
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transition-delay: 0s;
+}
 .source-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+.source-collapse > .source-grid { min-height: 0; overflow: hidden; }
 .source-card {
   min-width: 0;
   height: 55px;
