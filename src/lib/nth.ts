@@ -10,13 +10,20 @@ import {
   markVerifiedWebContext,
   needsFreshWeb,
   normalizeTopicState,
-  recentAnswerContext,
   requiresReferenceClarification,
   resolveContextualQuery,
   topicTerms,
   type ContextMessage,
   type TopicState
 } from "./context";
+import {
+  buildBudgetedContext,
+  normalizeConversationMemory,
+  reusableEvidence,
+  type ContextDiagnostics,
+  type ConversationMemory,
+  type EvidenceMemory
+} from "./memory";
 
 export type NthMode = "RUN" | "JOG" | "WALK";
 
@@ -41,6 +48,8 @@ export type NthMessage = {
   sources?: SearchSource[];
   searchQuery?: string;
   contextReused?: boolean;
+  createdAt?: number;
+  error?: boolean;
 };
 
 export type SearchSource = {
@@ -69,6 +78,7 @@ export type NthAnswer = {
   searchQuery?: string;
   contextReused: boolean;
   topicState: TopicState;
+  diagnostics: ContextDiagnostics;
 };
 
 export type AnswerPhase = "searching" | "generating" | "verifying";
@@ -276,24 +286,31 @@ function ageGrounding(sources: SearchSource[], state: TopicState): string {
   return `\n\nDETERMINISTIC AGE CALCULATION (authoritative for this answer):\n${facts.map(fact => `- ${fact.subject}: born ${fact.dateOfBirth}; age ${fact.age} on ${fact.asOf}.`).join("\n")}\nUse these calculated ages. Do not copy a stale age number from a snippet or model memory.`;
 }
 
-function verifiedEvidenceFrom(messages: NthMessage[]): { sources: SearchSource[]; evidence: string } | null {
-  const recent = [...messages].reverse().filter(message =>
-    message.role === "assistant" && Boolean(message.sources?.length) && Boolean(message.content.trim())
-  ).slice(0, 3);
-  if (!recent.length) return null;
-  const sources = uniqueSources(recent.map(message => ({
-    query: message.searchQuery || "recent verified context",
-    intent: "general_fresh",
-    search_queries: [],
-    sources: message.sources || [],
-    evidence: "",
-    engine_warnings: []
-  })));
-  const evidence = [
-    ...recent.map((message, index) => `RECENT VERIFIED NTH ANSWER ${index + 1}:\n${message.content}`),
-    ...sources.map((source, index) => `[${index + 1}] ${source.title}\n${source.snippet}\n${source.domain}`)
-  ].join("\n\n");
-  return { sources, evidence };
+function evidenceFromMemory(records: EvidenceMemory[]): { sources: SearchSource[]; evidence: string } | null {
+  if (!records.length) return null;
+  const sources: SearchSource[] = [];
+  const seen = new Set<string>();
+  for (const record of records) {
+    for (const source of record.sources) {
+      if (!source.url || seen.has(source.url)) continue;
+      seen.add(source.url);
+      sources.push({
+        ...source,
+        published_date: "",
+        engine: "conversation-memory",
+        official: false,
+        quality: "verified-memory",
+        score: 0,
+        content: "",
+        fetched: false
+      });
+    }
+  }
+  const evidence = records.map((record, recordIndex) => [
+    `VERIFIED MEMORY ${recordIndex + 1}: ${record.query}`,
+    ...record.sources.map((source, sourceIndex) => `[${sourceIndex + 1}] ${source.title}\n${source.snippet}\n${source.domain}`)
+  ].join("\n")).join("\n\n");
+  return { sources: sources.slice(0, 10), evidence };
 }
 
 function canReuseVerifiedContext(text: string, query: string, state: TopicState, evidence: string): boolean {
@@ -442,11 +459,12 @@ export async function answerNth(args: {
   forceWeb: boolean;
   web: WebSettings;
   topicState?: TopicState;
+  memory?: ConversationMemory;
   signal?: AbortSignal;
   onToken?: (token: string) => void;
   onPhase?: (phase: AnswerPhase) => void;
 }): Promise<NthAnswer> {
-  const { messages, mode, forceWeb, web, topicState: previousTopicState, signal, onToken, onPhase } = args;
+  const { messages, mode, forceWeb, web, topicState: previousTopicState, memory, signal, onToken, onPhase } = args;
   let lastUserIndex = -1;
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     if (messages[index].role === "user") {
@@ -459,14 +477,22 @@ export async function answerNth(args: {
   const hasVision = Boolean(lastUser?.attachments?.length);
   const priorMessages = lastUserIndex >= 0 ? messages.slice(0, lastUserIndex) : messages;
   const nextTopicState = normalizeTopicState(deriveTopicState(messages, previousTopicState));
+  const normalizedMemory = normalizeConversationMemory(memory, priorMessages, nextTopicState);
   const historyIntent = isConversationHistoryIntent(text);
   if (!hasVision && requiresReferenceClarification(text, nextTopicState, priorMessages)) {
+    const context = buildBudgetedContext({
+      messages,
+      memory: normalizedMemory,
+      topicState: nextTopicState,
+      policySize: NTH_POLICY_V2.length
+    });
     return {
       content: "Which subject do you mean? Name it once and I’ll continue from there.",
       route: "local",
       sources: [],
       contextReused: false,
-      topicState: nextTopicState
+      topicState: nextTopicState,
+      diagnostics: context.diagnostics
     };
   }
   const parts = decomposePrompt(text, 5);
@@ -505,8 +531,14 @@ export async function answerNth(args: {
 
   if (historyIntent) policy = conversationHistoryPolicy(messages);
 
+  const reusableEvidenceRecords = !forceWeb && searchRequests.length === 1
+    ? reusableEvidence(normalizedMemory, searchRequests[0].query, nextTopicState)
+    : [];
+  const memoryEvidence = !forceWeb && searchRequests.length === 1
+    ? evidenceFromMemory(reusableEvidenceRecords)
+    : null;
   const recentVerified = !forceWeb && searchRequests.length === 1
-    ? verifiedEvidenceFrom(priorMessages)
+    ? memoryEvidence
     : null;
   if (
     recentVerified
@@ -553,7 +585,16 @@ export async function answerNth(args: {
 
   if (signal?.aborted) throw abortError();
 
-  const apiMessages = recentAnswerContext(messages).map(message => ({
+  const context = buildBudgetedContext({
+    messages,
+    memory: normalizedMemory,
+    topicState: finalTopicState,
+    policySize: policy.length,
+    reusedEvidenceCount: contextReused ? reusableEvidenceRecords.length : 0
+  });
+  if (context.grounding) policy = `${policy}\n\n${context.grounding}`;
+
+  const apiMessages = context.messages.map(message => ({
     role: message.role,
     content: message.content,
     images: (message.attachments ?? [])
@@ -608,6 +649,7 @@ export async function answerNth(args: {
     sources,
     searchQuery: searchRequests.length ? resolvedQuery : undefined,
     contextReused,
-    topicState: finalTopicState
+    topicState: finalTopicState,
+    diagnostics: context.diagnostics
   };
 }

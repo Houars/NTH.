@@ -61,6 +61,7 @@ import {
   type UiMessage
 } from "./lib/history";
 import { deriveTopicState, isConversationHistoryIntent } from "./lib/context";
+import { rebuildConversationMemory } from "./lib/memory";
 import {
   checkNthUpdate,
   installNthUpdate,
@@ -293,7 +294,7 @@ function App() {
   const [maximized, setMaximized] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [composerNotice, setComposerNotice] = useState("");
-  const [appVersion, setAppVersion] = useState("0.5.7");
+  const [appVersion, setAppVersion] = useState("0.5.8");
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("idle");
   const [updateInfo, setUpdateInfo] = useState<NthUpdateInfo | null>(null);
   const [updateMessage, setUpdateMessage] = useState("NTH checks the signed release channel automatically.");
@@ -600,11 +601,13 @@ function App() {
     };
     const requestMessages = [...messages, userMessage];
     const requestTopicState = deriveTopicState(requestMessages, activeConversation.context);
+    const requestMemory = rebuildConversationMemory(requestMessages, requestTopicState, activeConversation.memory);
     const hasPriorUserMessage = messages.some(message => message.role === "user");
 
     updateConversation(conversationId, conversation => ({
       ...conversation,
       context: requestTopicState,
+      memory: requestMemory,
       title: hasPriorUserMessage ? conversation.title : titleForMessage(text, Boolean(sentAttachments.length)),
       updatedAt: Date.now(),
       messages: [...conversation.messages, userMessage, assistantMessage]
@@ -622,19 +625,21 @@ function App() {
       const result = await answerNth({
         messages: requestMessages
           .filter(message => !message.error)
-          .map(({ role, content, attachments: images, route: messageRoute, sources, searchQuery, contextReused }) => ({
+          .map(({ role, content, attachments: images, route: messageRoute, sources, searchQuery, contextReused, createdAt }) => ({
             role,
             content,
             attachments: images,
             route: messageRoute,
             sources,
             searchQuery,
-            contextReused
+            contextReused,
+            createdAt
           })),
         mode,
         forceWeb: webForced,
         web: { searxngUrl: settings.searxngUrl },
         topicState: requestTopicState,
+        memory: requestMemory,
         signal: controller.signal,
         onPhase: nextPhase => setPhase(nextPhase),
         onToken: token => {
@@ -648,11 +653,8 @@ function App() {
         }
       });
 
-      updateConversation(conversationId, conversation => ({
-        ...conversation,
-        context: result.topicState,
-        updatedAt: Date.now(),
-        messages: conversation.messages.map(message =>
+      updateConversation(conversationId, conversation => {
+        const nextMessages = conversation.messages.map(message =>
           message.id === assistantId
             ? {
                 ...message,
@@ -664,21 +666,35 @@ function App() {
                 streaming: false
               }
             : message
-        )
-      }));
+        );
+        return {
+          ...conversation,
+          context: result.topicState,
+          memory: rebuildConversationMemory(nextMessages, result.topicState, conversation.memory),
+          updatedAt: Date.now(),
+          messages: nextMessages
+        };
+      });
+      if (import.meta.env.DEV) {
+        (window as Window & { __NTH_CONTEXT_DEBUG__?: unknown }).__NTH_CONTEXT_DEBUG__ = result.diagnostics;
+      }
     } catch (error) {
       const stopped = error instanceof DOMException && error.name === "AbortError";
-      updateConversation(conversationId, conversation => ({
-        ...conversation,
-        updatedAt: Date.now(),
-        messages: conversation.messages.map(message => {
+      updateConversation(conversationId, conversation => {
+        const nextMessages = conversation.messages.map(message => {
           if (message.id !== assistantId) return message;
           if (stopped) {
             return { ...message, content: message.content || "Generation stopped.", streaming: false };
           }
           return { ...message, content: friendlyError(error), streaming: false, error: true };
-        })
-      }));
+        });
+        return {
+          ...conversation,
+          memory: rebuildConversationMemory(nextMessages, requestTopicState, conversation.memory),
+          updatedAt: Date.now(),
+          messages: nextMessages
+        };
+      });
     } finally {
       generationRef.current = null;
       setBusy(false);

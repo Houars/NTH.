@@ -28,6 +28,7 @@ const CURRENT_TECH_PATTERN = /\b(?:rtx\s*\d{3,4}(?:\s*(?:ti|super))?|radeon\s*(?
 const RESEARCH_COMMAND = /^(?:please\s+)?(?:research|look|dig|go)\s+(?:deeper|further|into it|more)(?:\s+(?:on|into)\s+that)?[.!?]*$/i;
 const VERIFY_COMMAND = /^(?:please\s+)?(?:verify\s+(?:that|this|it)|is\s+(?:that|this|it)\s+true|fact[- ]?check\s+(?:that|this|it)?)[.!?]*$/i;
 const OTHER_ONE_COMMAND = /^(?:and\s+)?(?:what|how)\s+about\s+(?:the\s+)?other\s+one[.!?]*$/i;
+const CORRECTION_COMMAND = /^(?:no(?:pe)?[,.: -]+|actually[,.: -]+|correction[: -]+|that(?:'s| is) (?:not|wrong)|i meant\b)/i;
 const FOLLOW_UP_PATTERN = /^(?:what\s+about\b|and\b|why\b|how\b|which(?:\s+one)?\b|who\s+is\s+older\b|is\s+(?:that|this|it)\b|(?:can you\s+)?verify\b|(?:please\s+)?(?:research|look|dig)\s+(?:deeper|further)|(?:he|she|it|they|this|that|his|her|its|their)\b)/i;
 const REFERENTIAL_WORDS = /\b(?:he|she|it|they|this|that|him|her|them|his|its|their|the other one)\b/i;
 
@@ -96,6 +97,7 @@ export function isContextualFollowUp(text: string): boolean {
   return RESEARCH_COMMAND.test(value)
     || VERIFY_COMMAND.test(value)
     || OTHER_ONE_COMMAND.test(value)
+    || CORRECTION_COMMAND.test(value)
     || REFERENTIAL_WORDS.test(value)
     || FOLLOW_UP_PATTERN.test(value);
 }
@@ -206,7 +208,7 @@ function extractEntities(text: string): string[] {
   for (const name of properNames) {
     if (
       !GENERIC_ENTITY_PREFIXES.has(name.toLowerCase())
-      && !/^(?:compare|tell|explain|describe|research|verify|how|what|who|is|are)\b/i.test(name)
+      && !/^(?:compare|tell|explain|describe|research|verify|how|what|who|is|are|now|back|the|always|never)\b/i.test(name)
     ) entities.push(compact(name));
   }
 
@@ -389,7 +391,7 @@ export function deriveTopicState(messages: ContextMessage[], previous?: TopicSta
       ...contextualBase,
       currentExplicitSubject: comparisonSubject || contextualBase.currentExplicitSubject,
       recentEntities: entities,
-      focus: RESEARCH_COMMAND.test(current.content) || VERIFY_COMMAND.test(current.content)
+      focus: RESEARCH_COMMAND.test(current.content) || VERIFY_COMMAND.test(current.content) || CORRECTION_COMMAND.test(current.content)
         ? contextualBase.focus || explicitFocus
         : explicitFocus || contextualBase.focus
     };

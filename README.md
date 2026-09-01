@@ -17,6 +17,8 @@ Rust, and Ollama.
 - Conversation-only routing precedence and verified-context reuse without repeat searches
 - Lightweight per-chat topic state, capped multi-question search decomposition, and deterministic age calculation
 - Separated explicit/search/history context with failed-search protection and bounded local-search retries
+- Topic-aware rolling conversation memory with a strict prompt budget and correction handling
+- Per-topic verified WEB evidence memory with freshness-based expiry and restart restoration
 - Collapsed-by-default verified source cards
 - In-app settings and service status without developer-facing error dumps
 

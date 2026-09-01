@@ -1,5 +1,10 @@
 import type { NthMessage, Route, SearchSource } from "./nth";
 import { emptyTopicState, normalizeTopicState, type TopicState } from "./context";
+import {
+  emptyConversationMemory,
+  normalizeConversationMemory,
+  type ConversationMemory
+} from "./memory";
 
 export type UiMessage = NthMessage & {
   id: string;
@@ -19,6 +24,7 @@ export type Conversation = {
   updatedAt: number;
   messages: UiMessage[];
   context?: TopicState;
+  memory?: ConversationMemory;
 };
 
 export type ConversationGroup = {
@@ -27,6 +33,7 @@ export type ConversationGroup = {
 };
 
 const HISTORY_KEY = "nth.conversations.v1";
+const HISTORY_TEMP_KEY = "nth.conversations.v1.pending";
 const LEGACY_CHAT_KEY = "nth.chat.v2";
 
 export function createConversation(now = Date.now()): Conversation {
@@ -36,7 +43,8 @@ export function createConversation(now = Date.now()): Conversation {
     createdAt: now,
     updatedAt: now,
     messages: [],
-    context: emptyTopicState()
+    context: emptyTopicState(),
+    memory: emptyConversationMemory()
   };
 }
 
@@ -72,25 +80,57 @@ function normalizeMessage(message: UiMessage, fallbackCreatedAt: number): UiMess
 
 function normalizeConversation(conversation: Conversation): Conversation {
   const createdAt = Number(conversation.createdAt) || Date.now();
+  const messages = conversation.messages.map(message => normalizeMessage(message, createdAt));
+  const context = normalizeTopicState(conversation.context);
   return {
     ...conversation,
     title: conversation.title?.trim() || "New conversation",
     createdAt,
     updatedAt: Number(conversation.updatedAt) || createdAt,
-    messages: conversation.messages.map(message => normalizeMessage(message, createdAt)),
-    context: normalizeTopicState(conversation.context)
+    messages,
+    context,
+    memory: normalizeConversationMemory(conversation.memory, messages, context)
   };
 }
 
+function readSavedConversations(key: string): Conversation[] {
+  const saved = JSON.parse(localStorage.getItem(key) || "[]") as unknown;
+  if (!Array.isArray(saved)) return [];
+  return saved.filter(isConversation).map(normalizeConversation);
+}
+
 export function loadConversations(): Conversation[] {
+  let primary: Conversation[] = [];
+  let pending: Conversation[] = [];
   try {
-    const saved = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]") as unknown;
-    if (Array.isArray(saved)) {
-      const conversations = saved.filter(isConversation).map(normalizeConversation);
-      if (conversations.length) return conversations;
-    }
+    primary = readSavedConversations(HISTORY_KEY);
   } catch {
     // A broken history entry should never prevent NTH from starting.
+  }
+
+  try {
+    pending = readSavedConversations(HISTORY_TEMP_KEY);
+  } catch {
+    // A pending write can also be corrupt; visible legacy history is tried next.
+  }
+
+  if (primary.length || pending.length) {
+    const newest = (items: Conversation[]) => Math.max(0, ...items.map(item => item.updatedAt));
+    if (pending.length && newest(pending) > newest(primary)) {
+      try {
+        localStorage.setItem(HISTORY_KEY, localStorage.getItem(HISTORY_TEMP_KEY) || "[]");
+        localStorage.removeItem(HISTORY_TEMP_KEY);
+      } catch {
+        // Recovery remains available in the pending key for the next startup.
+      }
+      return pending;
+    }
+    try {
+      localStorage.removeItem(HISTORY_TEMP_KEY);
+    } catch {
+      // Cleanup failure is harmless.
+    }
+    if (primary.length) return primary;
   }
 
   try {
@@ -103,7 +143,9 @@ export function loadConversations(): Conversation[] {
         title: titleForMessage(firstUser?.content || "Imported conversation", Boolean(firstUser?.attachments?.length)),
         createdAt: now,
         updatedAt: now,
-        messages: legacy.map(message => normalizeMessage(message, now))
+        messages: legacy.map(message => normalizeMessage(message, now)),
+        context: emptyTopicState(),
+        memory: emptyConversationMemory()
       }];
     }
   } catch {
@@ -119,7 +161,11 @@ export function saveConversations(conversations: Conversation[]): void {
       ...conversation,
       messages: conversation.messages.map(({ streaming: _streaming, ...message }) => message)
     }));
-    localStorage.setItem(HISTORY_KEY, JSON.stringify(stable));
+    const serialized = JSON.stringify(stable);
+    // One localStorage replacement is atomic in the WebView. Keeping a second
+    // full copy would double quota pressure for chats containing pasted images.
+    localStorage.setItem(HISTORY_KEY, serialized);
+    localStorage.removeItem(HISTORY_TEMP_KEY);
   } catch {
     // localStorage quotas vary. The active chat remains usable in memory.
   }
