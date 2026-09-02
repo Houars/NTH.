@@ -1,10 +1,13 @@
 {
   "name": "nth",
   "private": true,
-  "version": "0.6.0",
+  "version": "0.6.1",
   "type": "module",
   "scripts": {
     "test": "node scripts/test.mjs",
+    "test:files": "node scripts/test-files.mjs",
+    "test:files:live": "node scripts/test-files.mjs --live",
+    "fixtures": "node scripts/generate-file-fixtures.mjs",
     "dev": "node scripts/prepare-pdf-assets.mjs && vite",
     "build": "node scripts/prepare-pdf-assets.mjs && tsc && vite build",
     "preview": "vite preview",

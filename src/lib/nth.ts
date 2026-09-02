@@ -2,8 +2,8 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import { NTH_POLICY_V2 } from "./policy";
 import { logDiagnostic } from "./diagnostics";
 import {
-  citationFor, clipSerializedText, DOCUMENT_BUDGET, fileGrounding, fileNeedsFreshWeb, isDocumentSummary,
-  resolveDocumentScope, sourceFor, summaryBatches,
+  clipSerializedText, DOCUMENT_BUDGET, fileGrounding, fileNeedsFreshWeb, isDocumentSummary,
+  resolveDocumentScope, sourceFor, summaryBatches, documentExcerpt,
   type DocumentSource, type StoredDocument
 } from "./documents";
 import { loadReferencedDocuments } from "./documentStore";
@@ -49,6 +49,7 @@ export type Attachment = {
   dataUrl: string;
   kind?: "image" | "document";
   documentId?: string;
+  extractionStatus?: "ready" | "processing" | "error";
   size?: number;
   pageCount?: number;
   warning?: string;
@@ -65,6 +66,7 @@ export type NthMessage = {
   createdAt?: number;
   error?: boolean;
   documentSources?: DocumentSource[];
+  documentContextIds?: string[];
 };
 
 export type SearchSource = {
@@ -95,6 +97,7 @@ export type NthAnswer = {
   topicState: TopicState;
   diagnostics: ContextDiagnostics;
   documentSources?: DocumentSource[];
+  documentContextIds?: string[];
 };
 
 export type AnswerPhase = "resolving_context" | "searching" | "generating" | "verifying" | "vision" | "reading_files";
@@ -630,6 +633,7 @@ async function answerNthOperation(args: NthAnswerArgs): Promise<NthAnswer> {
   const documentRefs = historyIntent ? [] : resolveDocumentScope(messages);
   let documents: StoredDocument[] = [];
   if (documentRefs.length) {
+    logDiagnostic({ operation: "file_context", route: "file", attachmentCount: documentRefs.length });
     if (documentRefs.length > 8) throw new Error("Document context is too large. Ask about up to eight files at a time.");
     onPhase?.("reading_files");
     documents = await operationTimeout(loadReferencedDocuments(documentRefs, args.conversationId || ""), 10_000, operationId, "Document loading timed out.", signal);
@@ -791,7 +795,8 @@ async function answerNthOperation(args: NthAnswerArgs): Promise<NthAnswer> {
       for (const [index, batch] of batches.entries()) {
         if (signal?.aborted) throw abortError();
         if (Date.now() >= deadline) throw new Error("Document summary timed out.");
-        const section = batch.map(({ document, chunk }) => `${citationFor(sourceFor(document, chunk))}\n${chunk.text}`).join("\n\n");
+        const section = batch.map(({ document, chunk }) => documentExcerpt(document, chunk)).join("\n\n");
+        logDiagnostic({ operation: "file_summary_section", route: "file", chunkCount: batch.length, promptChars: JSON.stringify(section).length, selectedChunks: batch.map(item => ({ documentId: item.document.id, index: item.chunk.index, page: item.chunk.page })) });
         const note = await streamOllamaChat({
           model: MODEL_BY_MODE[mode], generationId: `${operationId}:file-summary:${index}`, maxTokens: 200,
           timeoutMs: Math.min(45_000, deadline - Date.now()), signal,
@@ -807,11 +812,14 @@ async function answerNthOperation(args: NthAnswerArgs): Promise<NthAnswer> {
       policy += fileGrounding(documentEvidence, `All ${batches.length} sections were processed in order. These are condensed section notes, not quotations. ${documents.map(document => document.warning || "").join(" ")}`);
     } else {
       const selected = await retrieveDocumentChunks(documents, text, priorMessages.slice(-2).map(message => message.content).join(" "), documentBudget, signal);
+      if (!selected.length) throw new Error("Document context is unavailable. Reattach the original file and retry.");
+      logDiagnostic({ operation: "file_retrieval", route: "file", chunkCount: selected.length, selectedChunks: selected.map(item => ({ documentId: item.document.id, index: item.chunk.index, page: item.chunk.page })) });
       documentSources = selected.map(({ document, chunk }) => sourceFor(document, chunk));
       documentSources = documentSources.filter((source, index, all) => all.findIndex(other => other.documentId === source.documentId && other.page === source.page) === index);
-      documentEvidence = selected.map(({ document, chunk }) => `${citationFor(sourceFor(document, chunk))}\n${chunk.text}`).join("\n\n");
+      documentEvidence = selected.map(({ document, chunk }) => documentExcerpt(document, chunk)).join("\n\n");
       policy += fileGrounding(documentEvidence, `${selected.length} of ${documents.reduce((sum, document) => sum + document.chunks.length, 0)} chunks. ${documents.map(document => document.warning || "").join(" ")} Retrieved excerpts are not proof of absence from unselected pages.`);
     }
+    if (isDocumentSummary(text)) policy += "\nFILE SUMMARY: Cover the beginning, middle and ending. Preserve distinctive project names, named roles, amounts, dates, decisions and final outcomes where supplied; do not substitute repeated boilerplate for these facts. Keep it compact and include the exact filename/page citations.";
   }
 
   const context = buildBudgetedContext({
@@ -822,6 +830,7 @@ async function answerNthOperation(args: NthAnswerArgs): Promise<NthAnswer> {
     reusedEvidenceCount: contextReused ? reusableEvidenceRecords.length : 0
   });
   if (context.grounding) policy = `${policy}\n\n${context.grounding}`;
+  if (hasDocuments) logDiagnostic({ operation: "file_prompt", route: searchRequests.length ? "file+web" : "file", promptChars: JSON.stringify(documentEvidence).length, estimatedTokens: Math.ceil(documentEvidence.length / 4), attachmentCount: documents.length });
 
   const apiMessages = context.messages.map(message => ({
     role: message.role,
@@ -895,7 +904,8 @@ async function answerNthOperation(args: NthAnswerArgs): Promise<NthAnswer> {
     contextReused,
     topicState: finalTopicState,
     diagnostics: context.diagnostics,
-    documentSources: documentSources.length ? documentSources : undefined
+    documentSources: documentSources.length ? documentSources : undefined,
+    documentContextIds: hasDocuments ? documents.map(document => document.id) : undefined
   };
 }
 

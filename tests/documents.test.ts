@@ -57,11 +57,42 @@ test("file scope survives long history, resolves ordinal/name references, and en
   assert.equal(resolveDocumentScope([...long, { role: "user", content: "Summarize manual.pdf" }])[0].documentId, "manual");
   assert.equal(documentInventory(long).length, 2);
   assert.equal(resolveDocumentScope([...long, { role: "user", content: "Why?" }]).length, 0);
+  messages[1].documentContextIds = [];
+  assert.equal(resolveDocumentScope([...messages, { role: "user", content: "Why?" }])[0].documentId, "notes");
 });
 
 test("file routing only adds WEB for external freshness, not internal recommendations", () => {
   for (const text of ["Summarize this PDF", "What did it recommend as the best GPU?", "Research its argument in depth", "What price did it mention?"]) assert.equal(fileNeedsFreshWeb(text), false);
   for (const text of ["Is this information still accurate?", "Compare this document with current RTX 5090 information", "Verify this online"]) assert.equal(fileNeedsFreshWeb(text), true);
+});
+
+test("v0.6.1 unqualified file questions retain persisted focus without keyword gates", () => {
+  const messages: NthMessage[] = [{ role: "user", content: "Summarize this file", attachments: [ref()] },
+    { role: "assistant", content: "Marcus Vale leads Blackbird.", route: "file", documentContextIds: ["notes"] }];
+  for (const question of ["Who is the lead developer?", "What's the budget?", "What was his name again?", "By how much?", "Which releases first?", "What did page 8 say?"]) {
+    assert.equal(resolveDocumentScope([...messages, { role: "user", content: question }])[0]?.documentId, "notes", question);
+  }
+  assert.equal(resolveDocumentScope([...messages, { role: "user", content: "How good is RTX 5090?" }]).length, 0);
+  const failedSwitch: NthMessage[] = [...messages, { role: "user", content: "Forget the files. Now GPUs." }, { role: "assistant", content: "Search failed", error: true }, { role: "user", content: "Why?" }];
+  assert.equal(resolveDocumentScope(failedSwitch).length, 0);
+});
+
+test("pending and malformed file records fail before any model request", async () => {
+  await seed(); let calls = 0;
+  mockIPC(() => { calls++; return { content: "must not run" }; });
+  for (const file of [{ ...ref(), extractionStatus: "processing" as const }, { ...ref(), documentId: undefined }]) {
+    await assert.rejects(answerNth({ ...args(), messages: [{ role: "user", content: "Who is the lead developer?", attachments: [file] }] }), /incomplete|local copy/);
+  }
+  assert.equal(calls, 0);
+});
+
+test("recovery keeps damaged document references visible rather than dropping file intent", () => {
+  const chat = createConversation();
+  chat.messages = [{ id: "u", role: "user", content: "Summarize this file", createdAt: 1, attachments: [{ ...ref(), dataUrl: undefined, mime: undefined } as never] }];
+  assert.ok(saveConversations([chat]));
+  const restored = loadConversations()[0].messages[0];
+  assert.equal(restored.attachments?.[0].documentId, "notes");
+  assert.equal(resolveDocumentScope([restored]).length, 1);
 });
 
 test("document cache transactions are conversation-scoped and retain blobs/pages", async () => {

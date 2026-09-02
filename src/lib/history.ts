@@ -104,9 +104,11 @@ function normalizeMessage(value: unknown, fallbackCreatedAt: number): UiMessage 
     createdAt: Number(message.createdAt) || fallbackCreatedAt,
     error: message.error || rawError || interrupted,
     attachments: Array.isArray(message.attachments) ? message.attachments.filter(image =>
-      image && typeof image.dataUrl === "string" && typeof image.mime === "string"
+      image && (image.kind === "document" || (typeof image.dataUrl === "string" && typeof image.mime === "string"))
     ).map(image => ({
       ...image,
+      dataUrl: image.kind === "document" ? "" : image.dataUrl,
+      mime: image.kind === "document" ? /\.pdf$/i.test(image.name || "") ? "application/pdf" : "text/plain" : image.mime,
       id: typeof image.id === "string" ? image.id : crypto.randomUUID(),
       name: typeof image.name === "string" && image.name ? image.name : image.kind === "document" ? "Unavailable file" : "Image",
       documentId: image.kind === "document" ? typeof image.documentId === "string" ? image.documentId : "unavailable" : undefined,
@@ -117,6 +119,7 @@ function normalizeMessage(value: unknown, fallbackCreatedAt: number): UiMessage 
       source && typeof source.documentId === "string" && typeof source.name === "string"
       && Number.isInteger(source.page) && source.page > 0 && Number.isInteger(source.endPage) && source.endPage >= source.page
     ) : undefined,
+    documentContextIds: Array.isArray(message.documentContextIds) ? message.documentContextIds.filter(id => typeof id === "string") : undefined,
     sources: Array.isArray(message.sources) ? message.sources.filter(source =>
       source && typeof source.url === "string" && typeof source.title === "string"
       && typeof source.snippet === "string" && typeof source.domain === "string"

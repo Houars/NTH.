@@ -1,5 +1,6 @@
 import type { Attachment } from "./nth";
 import { type StoredDocument } from "./documents";
+import { logDiagnostic } from "./diagnostics";
 
 function database(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -28,15 +29,18 @@ async function transaction<T>(mode: IDBTransactionMode, action: (store: IDBObjec
 export const saveDocument = (document: StoredDocument) => transaction<void>("readwrite", (store, done) => { store.put(document); done(); });
 export async function loadDocument(id: string, conversationId: string): Promise<StoredDocument | undefined> {
   const document = await transaction<StoredDocument | undefined>("readonly", (store, done) => { const request = store.get(id); request.onsuccess = () => done(request.result); });
-  if (!document || document.conversationId !== conversationId) return undefined;
+  if (!document || document.conversationId !== conversationId) { logDiagnostic({ operation: "file_cache", cache: "miss" }); return undefined; }
   if (document.version !== 1 || typeof document.name !== "string" || !["application/pdf", "text/plain"].includes(document.mime)
     || !Array.isArray(document.chunks) || !document.chunks.length || !Array.isArray(document.pages) || !document.pages.length || document.pages.length > 500 || !(document.blob instanceof Blob)
     || !document.pages.every((page, index) => page && page.page === index + 1 && typeof page.text === "string")
     || !document.chunks.every((chunk, index) => chunk && chunk.index === index && typeof chunk.text === "string" && Number.isInteger(chunk.page) && chunk.page > 0 && chunk.page <= document.pages.length && chunk.endPage === chunk.page)
-    || document.chunks.reduce((sum, chunk) => sum + chunk.text.length, 0) > 240_000) {
+    || document.chunks.reduce((sum, chunk) => sum + chunk.text.length, 0) > 240_000
+    || (document.extractionStatus !== undefined && document.extractionStatus !== "ready")) {
+    logDiagnostic({ operation: "file_cache", cache: "invalid", errorClass: "InvalidFileCache" });
     throw new Error("This file's local cache is unreadable. Reattach the original file; your chat is safe.");
   }
-  return document;
+  logDiagnostic({ operation: "file_cache", cache: "hit", extractionStatus: "ready", pageCount: document.pages.length, chunkCount: document.chunks.length });
+  return { ...document, extractionStatus: "ready" };
 }
 export const removeDocument = (id: string) => transaction<void>("readwrite", (store, done) => { store.delete(id); done(); });
 export const removeConversationDocuments = (id: string) => transaction<void>("readwrite", (store, done) => {
@@ -44,6 +48,7 @@ export const removeConversationDocuments = (id: string) => transaction<void>("re
   request.onsuccess = () => { const cursor = request.result; if (cursor) { store.delete(cursor.primaryKey); cursor.continue(); } else done(); };
 });
 export async function loadReferencedDocuments(refs: Attachment[], conversationId: string): Promise<StoredDocument[]> {
+  if (refs.some(ref => ref.extractionStatus && ref.extractionStatus !== "ready")) throw new Error("Document processing is incomplete. Reattach the original file and retry.");
   const documents = await Promise.all(refs.map(ref => loadDocument(ref.documentId || "", conversationId)));
   const missing = documents.findIndex(document => !document);
   if (missing >= 0) throw new Error(`The local copy of “${refs[missing].name}” is unavailable. Reattach the original file. Your conversation is preserved.`);

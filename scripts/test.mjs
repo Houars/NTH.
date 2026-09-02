@@ -1,12 +1,16 @@
 import { build } from "esbuild";
+import { mkdir } from "node:fs/promises";
+import { pathToFileURL } from "node:url";
+import { resolve } from "node:path";
 
-// Reuse Vite's existing compiler; no additional test dependency or generated files.
-const result = await build({
+// Reuse Vite's compiler. A local build file keeps failure traces readable.
+await mkdir(".test-build", { recursive: true });
+await build({
   entryPoints: ["tests/reliability.test.ts"],
   bundle: true,
-  write: false,
+  outfile: ".test-build/unit-tests.mjs",
   platform: "node",
   format: "esm",
   define: { "import.meta.env.DEV": "false" }
 });
-await import(`data:text/javascript;base64,${Buffer.from(result.outputFiles[0].text).toString("base64")}`);
+await import(pathToFileURL(resolve(".test-build/unit-tests.mjs")).href);

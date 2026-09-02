@@ -6,9 +6,13 @@ const pending: Array<() => void> = [];
 mockWindows("main");
 mockIPC((command, payload: any) => {
   if (command === "ollama_health") return { reachable: true, modelInstalled: true, expectedModel: MODEL_BY_MODE.RUN, installedModels: [MODEL_BY_MODE.RUN] };
-  if (command === "ollama_chat_stream") return new Promise(resolve => pending.push(() => resolve({ content: "The recommendation is 32 GB VRAM. [gpu-notes.pdf · p. 2]" })));
+  if (command === "ollama_chat_stream") {
+    const files = [...new Set((payload.policy.match(/\[[^\]\n]+\.(?:txt|md|pdf)(?: · pp?\. [^\]]+)?\]/g) || []))];
+    transport.textContent = `MOCK MODEL · ${files.length ? "FILE evidence received: " + files.join(" / ") : "No FILE evidence"}`;
+    return new Promise(resolve => pending.push(() => resolve({ content: payload.policy.includes("Marcus Vale") ? "Marcus Vale leads Blackbird. [blackbird.txt]" : "The recommendation is 32 GB VRAM. [gpu-notes.pdf · p. 2]" })));
+  }
   if (command === "cancel_operation") { pending.splice(0).forEach(resolve => resolve()); return; }
-  if (command === "plugin:app|version") return "0.6.0-test";
+  if (command === "plugin:app|version") return "0.6.1-test";
   return false;
 });
 await import("../src/main");
@@ -36,3 +40,7 @@ control("Fixture scanned", () => drop(pdf(true)));
 control("Complete reply", () => pending.shift()?.());
 document.addEventListener("keydown", event => { if (event.key === "F8") { event.preventDefault(); pending.shift()?.(); } });
 document.body.append(toolbar);
+const transport = document.createElement("output");
+transport.setAttribute("aria-label", "Model transport inspection");
+transport.style.cssText = "position:fixed;top:82px;left:260px;z-index:500;font-size:10px;color:#aaa;max-width:65vw";
+document.body.append(transport);

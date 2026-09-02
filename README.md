@@ -29,6 +29,36 @@ Rust, and Ollama.
 
 ## Files & documents (0.6.0)
 
+### File context hotfix (0.6.1)
+
+File focus now survives unqualified questions ("Who is the lead developer?",
+"What's the budget?", "By how much?") and saved-chat follow-ups. The outgoing
+message and transactional cache—not draft UI state—supply authoritative file
+references. An explicit extraction status gates generation; missing, damaged,
+or incomplete file records fail visibly instead of becoming LOCAL answers.
+Failed imports block Send until successfully reattached or explicitly excluded.
+
+PDF extraction uses matching PDF.js compatibility builds. Prompts identify each
+file's name/type and page boundaries, retain context across multi-question turns,
+and preserve distinctive beginning/middle/end facts in summaries. Multi-page
+questions prioritize each requested page without lifting the context budget.
+
+Generate the local development fixtures with `npm run fixtures`. Run
+`npm run test:files` for full ingestion/prompt contract checks, or
+`npm run test:files:live` for actual Gemma answer assertions. The harness uses the
+real extraction worker and chat/cache round-trips; only browser APIs are adapted
+for Node. Contract mode mocks model output. Both modes use deterministic WEB
+fixtures, not live search engines. Reports with expected/actual results are
+written to `test-fixtures/reports/{contract,live}.{json,md}`. The release workflow
+gates publishing on the offline contract suite. Fixtures and reports are not
+bundled with NTH. See [fixture documentation](test-fixtures/README.md).
+
+Local diagnostics now include extraction start/end/failure, approximate token
+and character counts, pages/chunks, cache hits/misses, chosen chunks, route and
+prompt size. No document contents or telemetry are logged.
+
+### Attachment behavior
+
 Attach up to four images/files per message using the picker, drop, or clipboard
 files. PDFs, TXT, Markdown, JSON, CSV/TSV, and common source-code/config files are
 supported. Image attachments still use the existing vision pipeline.

@@ -351,8 +351,9 @@ function App() {
   const [maximized, setMaximized] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [composerNotice, setComposerNotice] = useState("");
+  const [fileImportFailed, setFileImportFailed] = useState(false);
   const [storageNotice, setStorageNotice] = useState("");
-  const [appVersion, setAppVersion] = useState("0.6.0");
+  const [appVersion, setAppVersion] = useState("0.6.1");
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("idle");
   const [updateInfo, setUpdateInfo] = useState<NthUpdateInfo | null>(null);
   const [updateMessage, setUpdateMessage] = useState("NTH checks the signed release channel automatically.");
@@ -394,7 +395,7 @@ function App() {
   const ready = Boolean(ollamaHealth?.reachable && ollamaHealth.modelInstalled);
   const busy = ACTIVE_OPERATIONS.has(operation);
   const phase = busy ? operation as AnswerPhase : null;
-  const canSend = !busy && !importing && updateStatus !== "downloading" && Boolean(input.trim() || attachments.length);
+  const canSend = !busy && !importing && !fileImportFailed && updateStatus !== "downloading" && Boolean(input.trim() || attachments.length);
 
   useEffect(() => {
     const disconnect = focusRef.current!.connect();
@@ -752,6 +753,7 @@ function App() {
       if (activeIdRef.current !== conversationId || importRef.current !== controller) return;
       setAttachments(current => [...current, ...next].filter((file, index, all) => !file.documentId || all.findIndex(other => other.documentId === file.documentId) === index).slice(0, 4));
       setComposerNotice(controller.signal.aborted ? "File import stopped." : errors[0] || next.find(file => file.warning)?.warning || (files.length > room ? "Only the first four attachments were added." : ""));
+      setFileImportFailed(errors.length > 0);
       if (errors.length) logDiagnostic({ operation: "extract_file", errorClass: "FileImportFailure" });
     } finally {
       if (importRef.current === controller) {
@@ -771,6 +773,7 @@ function App() {
   }
 
   function abandonImport() {
+    setFileImportFailed(false);
     importRef.current?.abort();
     importRef.current = null;
     setImporting(false);
@@ -875,7 +878,7 @@ function App() {
         conversationId,
         messages: requestMessages
           .filter(message => !message.error)
-          .map(({ role, content, attachments: images, route: messageRoute, sources, searchQuery, contextReused, createdAt, documentSources }) => ({
+          .map(({ role, content, attachments: images, route: messageRoute, sources, searchQuery, contextReused, createdAt, documentSources, documentContextIds }) => ({
             role,
             content,
             attachments: images,
@@ -884,7 +887,8 @@ function App() {
             searchQuery,
             contextReused,
             createdAt,
-            documentSources
+            documentSources,
+            documentContextIds
           })),
         mode,
         forceWeb,
@@ -918,6 +922,7 @@ function App() {
                 searchQuery: result.searchQuery,
                 contextReused: result.contextReused,
                 documentSources: result.documentSources,
+                documentContextIds: result.documentContextIds,
                 streaming: false,
                 error: false,
                 failure: undefined
@@ -994,7 +999,7 @@ function App() {
   }
 
   async function send() {
-    if (!canSend || !activeConversation || submissionRef.current || Date.now() - lastSubmissionAtRef.current < 400) return;
+    if (!canSend || importRef.current || !activeConversation || submissionRef.current || Date.now() - lastSubmissionAtRef.current < 400) return;
     lastSubmissionAtRef.current = Date.now();
     submissionRef.current = true;
 
@@ -1433,6 +1438,7 @@ function App() {
             </div>
             <div className="composer-footer">
               <span className={composerNotice || storageNotice ? "notice" : ""}>{storageNotice || composerNotice || "ENTER TO SEND · SHIFT+ENTER FOR NEW LINE"}</span>
+              {fileImportFailed && <button onClick={() => { setFileImportFailed(false); setComposerNotice("Failed file excluded. Reattach it to ask about its contents."); focusRef.current?.claim(); }}>Exclude failed file</button>}
               <span>{mode} · GEMMA 4 12B Q4 · THINK OFF</span>
             </div>
           </div>

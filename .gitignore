@@ -1,6 +1,9 @@
 node_modules/
 dist/
 public/pdf-assets/
+test-fixtures/files/
+test-fixtures/reports/
+.test-build/
 src-tauri/target/
 src-tauri/gen/schemas/
 *.log

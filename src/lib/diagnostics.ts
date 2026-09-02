@@ -8,6 +8,15 @@ export type DiagnosticEvent = {
   serviceFailure?: "ollama" | "model" | "searxng" | "updater" | "vision" | "persistence";
   retryCount?: number;
   errorClass?: string;
+  attachmentCount?: number;
+  extractedChars?: number;
+  estimatedTokens?: number;
+  pageCount?: number;
+  chunkCount?: number;
+  promptChars?: number;
+  cache?: "hit" | "miss" | "invalid";
+  extractionStatus?: "processing" | "ready" | "error";
+  selectedChunks?: Array<{ documentId: string; index: number; page: number }>;
 };
 
 const MAX_DIAGNOSTICS = 100;

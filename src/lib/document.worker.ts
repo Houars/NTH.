@@ -10,8 +10,10 @@ self.onmessage = async (event: MessageEvent<{ buffer: ArrayBuffer; pdf: boolean;
     const pages: DocumentPage[] = [];
     let warning = "";
     if (event.data.pdf) {
-      const pdfjs = await import("pdfjs-dist");
-      const workerUrl = (await import("pdfjs-dist/build/pdf.worker.min.mjs?url")).default;
+      // Use the matching compatibility builds: modern PDF.js requires newer
+      // typed-array APIs that are absent in some installed WebView runtimes.
+      const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+      const workerUrl = (await import("pdfjs-dist/legacy/build/pdf.worker.min.mjs?url")).default;
       pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
       // PDF.js runs its parser in this already-isolated worker. Text extraction
       // never renders pages or executes PDF JavaScript/actions/attachments.
@@ -52,7 +54,7 @@ self.onmessage = async (event: MessageEvent<{ buffer: ArrayBuffer; pdf: boolean;
   } catch (error) {
     const name = error instanceof Error ? error.name : "";
     const message = error instanceof Error ? error.message : "";
-    self.postMessage({ nthDocument: true, error: name === "PasswordException" ? "This PDF is password-protected. Attach an unlocked copy."
+    self.postMessage({ nthDocument: true, errorClass: name || "ExtractionError", error: name === "PasswordException" ? "This PDF is password-protected. Attach an unlocked copy."
       : /^(Use a PDF|This document|This PDF has no|This text encoding|That file)/.test(message) ? message
       : "That PDF is corrupt or could not be read. Export a fresh PDF with embedded text and try again." });
   }
