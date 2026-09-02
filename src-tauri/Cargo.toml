@@ -1,6 +1,6 @@
 [package]
 name = "nth"
-version = "0.5.9"
+version = "0.6.0"
 description = "NTH local AI desktop"
 authors = ["Xöz"]
 edition = "2021"

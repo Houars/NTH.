@@ -17,6 +17,7 @@ import {
   Copy,
   Download,
   ExternalLink,
+  FileText,
   Globe2,
   ImagePlus,
   Maximize2,
@@ -72,6 +73,11 @@ import {
   type NthUpdateInfo
 } from "./lib/updater";
 import { logDiagnostic } from "./lib/diagnostics";
+import { citationFor, compactSize, documentInventory, FILE_ACCEPT, fileNeedsFreshWeb, fileType, isDocument, resolveDocumentScope, type StoredDocument } from "./lib/documents";
+import { importDocument } from "./lib/documentImport";
+import { loadDocument, removeConversationDocuments, removeDocument } from "./lib/documentStore";
+import { createComposerFocus } from "./lib/composerFocus";
+import { DocumentReader } from "./components/DocumentReader";
 
 const SETTINGS_KEY = "nth.settings.v2";
 const MODE_KEY = "nth.mode.v1";
@@ -96,7 +102,8 @@ const ACTIVE_OPERATIONS = new Set<OperationState>([
   "searching",
   "verifying",
   "generating",
-  "vision"
+  "vision",
+  "reading_files"
 ]);
 const CHAT_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 const MAX_CHAT_IMAGE_BYTES = 12 * 1024 * 1024;
@@ -224,11 +231,14 @@ async function chatAttachmentFor(file: File): Promise<Attachment> {
     id: crypto.randomUUID(),
     name: file.name || "pasted-image.png",
     mime: file.type,
+    size: file.size,
     dataUrl
   };
 }
 
-function predictedRoute(text: string, hasVision: boolean, forceWeb: boolean, context: UiMessage[] = []): Route {
+function predictedRoute(text: string, hasVision: boolean, forceWeb: boolean, context: UiMessage[] = [], attachments: Attachment[] = []): Route {
+  const files = resolveDocumentScope([...context, { role: "user", content: text, attachments }]);
+  if (files.length) return forceWeb || fileNeedsFreshWeb(text) ? "file+web" : "file";
   const useWeb = !isConversationHistoryIntent(text) && (forceWeb || needsWeb(text, context.filter(message => !message.error)));
   if (hasVision && useWeb) return "vision+web";
   if (hasVision) return "vision";
@@ -237,6 +247,8 @@ function predictedRoute(text: string, hasVision: boolean, forceWeb: boolean, con
 }
 
 function routeLabels(route?: Route, contextReused = false): string[] {
+  if (route === "file") return ["FILE"];
+  if (route === "file+web") return ["FILE", "WEB"];
   if (contextReused) return ["CONTEXT"];
   if (!route || route === "local") return ["LOCAL"];
   if (route === "vision+web") return ["VISION", "WEB"];
@@ -321,6 +333,9 @@ function App() {
   const [mode, setMode] = useState<NthMode>(loadMode);
   const [settings, setSettings] = useState<SettingsState>(loadSettings);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [importing, setImporting] = useState(false);
+  const [reader, setReader] = useState<{ document: StoredDocument; page: number } | null>(null);
+  const [missingFiles, setMissingFiles] = useState<Set<string>>(new Set());
   const [ollamaHealth, setOllamaHealth] = useState<OllamaHealth | null>(null);
   const [checkingStatus, setCheckingStatus] = useState(true);
   const [searxngOnline, setSearxngOnline] = useState<boolean | null>(null);
@@ -337,7 +352,7 @@ function App() {
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [composerNotice, setComposerNotice] = useState("");
   const [storageNotice, setStorageNotice] = useState("");
-  const [appVersion, setAppVersion] = useState("0.5.9");
+  const [appVersion, setAppVersion] = useState("0.6.0");
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("idle");
   const [updateInfo, setUpdateInfo] = useState<NthUpdateInfo | null>(null);
   const [updateMessage, setUpdateMessage] = useState("NTH checks the signed release channel automatically.");
@@ -348,11 +363,20 @@ function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const avatarInputRef = useRef<HTMLInputElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const focusBlockedRef = useRef(false);
+  focusBlockedRef.current = settingsOpen || Boolean(reader);
+  const focusRef = useRef<ReturnType<typeof createComposerFocus> | null>(null);
+  if (!focusRef.current) focusRef.current = createComposerFocus(() => textareaRef.current, () => focusBlockedRef.current);
+  const importRef = useRef<AbortController | null>(null);
+  const readerTriggerRef = useRef<HTMLElement | null>(null);
+  const activeIdRef = useRef(activeId);
+  activeIdRef.current = activeId;
   const chatRef = useRef<HTMLElement | null>(null);
   const generationRef = useRef<AbortController | null>(null);
   const submissionRef = useRef(false);
   const lastSubmissionAtRef = useRef(0);
   const updateBusyRef = useRef(false);
+  const pendingFileDeletesRef = useRef(new Set<string>());
   const conversationsRef = useRef(conversations);
   conversationsRef.current = conversations;
   const persistenceRef = useRef({ at: 0, structure: "" });
@@ -365,11 +389,59 @@ function App() {
   );
   const messages = activeConversation?.messages || [];
   const groups = useMemo(() => groupConversations(conversations), [conversations]);
-  const autoWeb = needsWeb(input, messages.filter(message => !message.error));
+  const draftFileScope = resolveDocumentScope([...messages, { role: "user", content: input, attachments }]);
+  const autoWeb = draftFileScope.length ? fileNeedsFreshWeb(input) : needsWeb(input, messages.filter(message => !message.error));
   const ready = Boolean(ollamaHealth?.reachable && ollamaHealth.modelInstalled);
   const busy = ACTIVE_OPERATIONS.has(operation);
   const phase = busy ? operation as AnswerPhase : null;
-  const canSend = !busy && updateStatus !== "downloading" && Boolean(input.trim() || attachments.length);
+  const canSend = !busy && !importing && updateStatus !== "downloading" && Boolean(input.trim() || attachments.length);
+
+  useEffect(() => {
+    const disconnect = focusRef.current!.connect();
+    if (document.activeElement === document.body) focusRef.current!.claim();
+    return () => { disconnect(); importRef.current?.abort(); };
+  }, []);
+
+  const fileReferenceKey = documentInventory(messages).map(file => file.documentId).join("|");
+  useEffect(() => {
+    let cancelled = false;
+    const refs = documentInventory(messages);
+    void Promise.all(refs.map(async file => {
+      try { return await loadDocument(file.documentId!, activeId) ? "" : file.documentId!; }
+      catch { return file.documentId!; }
+    })).then(ids => { if (!cancelled) setMissingFiles(new Set(ids.filter(Boolean))); });
+    return () => { cancelled = true; };
+  }, [activeId, fileReferenceKey]);
+
+  async function openDocument(documentId: string, page = 1) {
+    readerTriggerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    focusRef.current?.release();
+    const conversationId = activeId;
+    try {
+      const document = await loadDocument(documentId, conversationId);
+      if (activeIdRef.current !== conversationId) return;
+      if (!document) { setComposerNotice("The local file copy is unavailable. Reattach the original file; your conversation is safe."); return; }
+      setReader({ document, page });
+    } catch { setComposerNotice("The local file copy could not be read. Reattach the original file."); }
+  }
+
+  function closeDocument() {
+    setReader(null);
+    requestAnimationFrame(() => readerTriggerRef.current?.focus({ preventScroll: true }));
+  }
+
+  function messageWithCitations(message: UiMessage) {
+    if (!message.documentSources?.length) return message.content;
+    return message.content.split(/(\[[^\]\n]{1,220}\])/g).map((part, index) => {
+      const source = message.documentSources!.find(source => {
+        if (!part.startsWith(`[${source.name}`)) return false;
+        const page = part.match(/·\s*pp?\.\s*(\d+)(?:[–-](\d+))?/);
+        return !source.pdf ? part === `[${source.name}]` : Boolean(page && Number(page[1]) >= source.page && Number(page[2] || page[1]) <= source.endPage);
+      });
+      const page = Number(part.match(/·\s*pp?\.\s*(\d+)/)?.[1] || source?.page || 1);
+      return source ? <button className="file-citation" key={index} onClick={() => void openDocument(source.documentId, page)}>{part}</button> : part;
+    });
+  }
 
   async function chooseAvatar(file?: File) {
     if (!file) return;
@@ -405,6 +477,10 @@ function App() {
 
   function persistChats(): boolean {
     const saved = saveConversations(conversationsRef.current);
+    if (saved) for (const id of pendingFileDeletesRef.current) {
+      pendingFileDeletesRef.current.delete(id);
+      void removeConversationDocuments(id).catch(() => logDiagnostic({ operation: "delete_chat_files", errorClass: "FileStorageFailure" }));
+    }
     setStorageNotice(saved ? "" : "Chats could not be saved. Keep NTH open and check local storage.");
     if (!saved) logDiagnostic({ operation: "save_chats", serviceFailure: "persistence", errorClass: "StorageWriteFailed" });
     return saved;
@@ -603,14 +679,15 @@ function App() {
 
   useEffect(() => {
     const onPaste = async (event: ClipboardEvent) => {
-      const files = Array.from(event.clipboardData?.files || []).filter(file => file.type.startsWith("image/"));
+      if (settingsOpen || reader || event.target !== textareaRef.current) return;
+      const files = Array.from(event.clipboardData?.files || []);
       if (!files.length) return;
       event.preventDefault();
       await addFiles(files);
     };
     window.addEventListener("paste", onPaste);
     return () => window.removeEventListener("paste", onPaste);
-  }, [attachments.length]);
+  }, [attachments.length, settingsOpen, reader, activeId]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -649,40 +726,64 @@ function App() {
   }
 
   async function addFiles(files: File[]) {
-    if (!files.length) return;
-    const images = files.filter(file => CHAT_IMAGE_TYPES.has(file.type));
-    if (!images.length) {
-      setComposerNotice("Use a PNG, JPEG, WebP, or GIF image.");
-      window.setTimeout(() => setComposerNotice(""), 2200);
-      return;
-    }
-
+    if (!files.length || importRef.current || !activeConversation || settingsOpen || reader) return;
+    const conversationId = activeConversation.id;
     const room = Math.max(0, 4 - attachments.length);
     if (!room) {
-      setComposerNotice("You can attach up to four images.");
-      window.setTimeout(() => setComposerNotice(""), 2200);
+      setComposerNotice("You can attach up to four files or images per message.");
       return;
     }
-
-    const settled = await Promise.allSettled(images.slice(0, room).map(chatAttachmentFor));
-    const next = settled.flatMap(result => result.status === "fulfilled" ? [result.value] : []);
-    const failed = settled.find(result => result.status === "rejected");
-    if (failed?.status === "rejected") {
-      const message = failed.reason instanceof Error ? failed.reason.message : "NTH could not read that image.";
-      setComposerNotice(message);
-      window.setTimeout(() => setComposerNotice(""), 3200);
-      logDiagnostic({ operation: "validate_vision", serviceFailure: "vision", errorClass: "InvalidImage" });
+    const controller = new AbortController();
+    importRef.current = controller;
+    setImporting(true);
+    setComposerNotice("Reading files locally…");
+    focusRef.current?.claim();
+    const next: Attachment[] = [], errors: string[] = [];
+    // One parser at a time keeps large PDF imports from monopolizing memory.
+    try {
+      for (const file of files.slice(0, room)) {
+        if (controller.signal.aborted) break;
+        try { next.push(file.type.startsWith("image/") ? await chatAttachmentFor(file) : await importDocument(file, conversationId, controller.signal)); }
+        catch (error) {
+          const detail = error instanceof Error ? error.message : "";
+          if (!controller.signal.aborted) errors.push(/^(?:Use |That |This |File |Local file |The file )/.test(detail) ? detail : "NTH could not read that file. Reattach a fresh copy.");
+        }
+      }
+      if (activeIdRef.current !== conversationId || importRef.current !== controller) return;
+      setAttachments(current => [...current, ...next].filter((file, index, all) => !file.documentId || all.findIndex(other => other.documentId === file.documentId) === index).slice(0, 4));
+      setComposerNotice(controller.signal.aborted ? "File import stopped." : errors[0] || next.find(file => file.warning)?.warning || (files.length > room ? "Only the first four attachments were added." : ""));
+      if (errors.length) logDiagnostic({ operation: "extract_file", errorClass: "FileImportFailure" });
+    } finally {
+      if (importRef.current === controller) {
+        importRef.current = null;
+        setImporting(false);
+        focusRef.current?.restore();
+      }
     }
-    setAttachments(current => [...current, ...next].slice(0, 4));
-    textareaRef.current?.focus();
+  }
+
+  function removeAttachment(file: Attachment) {
+    setAttachments(current => current.filter(item => item.id !== file.id));
+    if (file.documentId && !documentInventory(messages).some(ref => ref.documentId === file.documentId)) {
+      void removeDocument(file.documentId).catch(() => logDiagnostic({ operation: "remove_file", errorClass: "FileStorageFailure" }));
+    }
+    focusRef.current?.claim();
+  }
+
+  function abandonImport() {
+    importRef.current?.abort();
+    importRef.current = null;
+    setImporting(false);
+    setComposerNotice("");
   }
 
   function createNewChat() {
     if (busy) return;
+    abandonImport();
     if (activeConversation?.messages.length === 0) {
       setInput("");
       setAttachments([]);
-      textareaRef.current?.focus();
+      focusRef.current?.claim();
       setMobileSidebarOpen(false);
       return;
     }
@@ -693,19 +794,23 @@ function App() {
     setAttachments([]);
     setWebForced(false);
     setMobileSidebarOpen(false);
-    window.setTimeout(() => textareaRef.current?.focus(), 0);
+    focusRef.current?.claim();
   }
 
   function selectConversation(id: string) {
     if (busy) return;
+    abandonImport();
     setActiveId(id);
     setMobileSidebarOpen(false);
     setInput("");
     setAttachments([]);
+    focusRef.current?.claim();
   }
 
   function deleteConversation(id: string) {
     if (busy && id === activeId) return;
+    if (id === activeId) abandonImport();
+    pendingFileDeletesRef.current.add(id);
     setConversations(current => {
       const remaining = current.filter(conversation => conversation.id !== id);
       if (remaining.length) {
@@ -720,12 +825,14 @@ function App() {
 
   function clearHistory() {
     if (busy) return;
+    abandonImport();
     const replacement = createConversation();
     if (!saveConversations([replacement], true)) {
       setStorageNotice("Chat history could not be cleared. Check local storage and try again.");
       return;
     }
     setConversations([replacement]);
+    for (const conversation of conversations) void removeConversationDocuments(conversation.id).catch(() => logDiagnostic({ operation: "clear_files", errorClass: "FileStorageFailure" }));
     setActiveId(replacement.id);
     setInput("");
     setAttachments([]);
@@ -756,7 +863,7 @@ function App() {
     const controller = new AbortController();
     const started = performance.now();
     const progress: { phase: AnswerPhase } = { phase: "resolving_context" };
-    const predicted = predictedRoute(userMessage.content, Boolean(userMessage.attachments?.length), forceWeb, requestMessages.slice(0, -1));
+    const predicted = predictedRoute(userMessage.content, Boolean(userMessage.attachments?.some(file => file.mime.startsWith("image/"))), forceWeb, requestMessages.slice(0, -1), userMessage.attachments);
     generationRef.current = controller;
     setOperation("resolving_context");
     setAtBottom(true);
@@ -765,9 +872,10 @@ function App() {
       await ensureOllamaReady(retryCount > 0);
       const result = await answerNth({
         operationId,
+        conversationId,
         messages: requestMessages
           .filter(message => !message.error)
-          .map(({ role, content, attachments: images, route: messageRoute, sources, searchQuery, contextReused, createdAt }) => ({
+          .map(({ role, content, attachments: images, route: messageRoute, sources, searchQuery, contextReused, createdAt, documentSources }) => ({
             role,
             content,
             attachments: images,
@@ -775,7 +883,8 @@ function App() {
             sources,
             searchQuery,
             contextReused,
-            createdAt
+            createdAt,
+            documentSources
           })),
         mode,
         forceWeb,
@@ -808,6 +917,7 @@ function App() {
                 sources: result.sources,
                 searchQuery: result.searchQuery,
                 contextReused: result.contextReused,
+                documentSources: result.documentSources,
                 streaming: false,
                 error: false,
                 failure: undefined
@@ -836,7 +946,7 @@ function App() {
         (window as Window & { __NTH_CONTEXT_DEBUG__?: unknown }).__NTH_CONTEXT_DEBUG__ = result.diagnostics;
       }
     } catch (error) {
-      const failure = classifyNthError(controller.signal.aborted ? new DOMException("Operation cancelled", "AbortError") : error, MODEL_BY_MODE[mode], Boolean(userMessage.attachments?.length));
+      const failure = classifyNthError(controller.signal.aborted ? new DOMException("Operation cancelled", "AbortError") : error, MODEL_BY_MODE[mode], Boolean(userMessage.attachments?.some(file => file.mime.startsWith("image/"))));
       updateConversation(conversationId, conversation => ({
         ...conversation,
         updatedAt: Date.now(),
@@ -879,6 +989,7 @@ function App() {
     } finally {
       if (generationRef.current === controller) generationRef.current = null;
       submissionRef.current = false;
+      focusRef.current?.restore();
     }
   }
 
@@ -888,7 +999,7 @@ function App() {
     submissionRef.current = true;
 
     const conversationId = activeConversation.id;
-    const text = input.trim() || "Describe this image.";
+    const text = input.trim() || (attachments.some(isDocument) ? "Summarize the attached files." : "Describe this image.");
     const sentAttachments = attachments;
     const forceWeb = webForced;
     const userMessage: UiMessage = {
@@ -903,7 +1014,7 @@ function App() {
       id: assistantId,
       role: "assistant",
       content: "",
-      route: predictedRoute(text, Boolean(sentAttachments.length), forceWeb, messages),
+      route: predictedRoute(text, Boolean(sentAttachments.some(file => file.mime.startsWith("image/"))), forceWeb, messages, sentAttachments),
       createdAt: Date.now(),
       streaming: true
     };
@@ -923,6 +1034,8 @@ function App() {
     setInput("");
     setAttachments([]);
     setWebForced(false);
+    setComposerNotice("");
+    focusRef.current?.claim();
     await executeRequest({
       conversationId,
       userMessage,
@@ -947,6 +1060,7 @@ function App() {
     const requestTopicState = rebuildTopicState(requestMessages);
     const requestMemory = rebuildConversationMemory(requestMessages, requestTopicState);
     const retryCount = message.failure.retryCount + 1;
+    focusRef.current?.claim();
     lastSubmissionAtRef.current = Date.now();
     submissionRef.current = true;
     updateConversation(activeConversation.id, conversation => ({
@@ -974,6 +1088,7 @@ function App() {
 
   function stopGeneration() {
     generationRef.current?.abort();
+    focusRef.current?.claim();
   }
 
   function handleComposerKeyDown(event: ReactKeyboardEvent<HTMLTextAreaElement>) {
@@ -1049,6 +1164,8 @@ function App() {
       ? "Checking sources…"
       : phase === "vision"
         ? "Processing image…"
+      : phase === "reading_files"
+        ? "Reading files…"
       : phase === "generating"
         ? "Answering…"
         : "Resolving context…";
@@ -1195,13 +1312,15 @@ function App() {
                       {message.attachments?.length ? (
                         <div className="message-images">
                           {message.attachments.map(attachment => (
-                            <img src={attachment.dataUrl} alt={attachment.name} key={attachment.id} />
+                            isDocument(attachment) ? <button className="file-chip" key={attachment.id} onClick={() => void openDocument(attachment.documentId!)} title={attachment.warning}>
+                              <FileText size={17} /><span><strong>{attachment.name}</strong><small>{fileType(attachment.name)} · {compactSize(attachment.size)}{missingFiles.has(attachment.documentId!) ? " · UNAVAILABLE" : " · LOCAL COPY"}</small></span>
+                            </button> : <img src={attachment.dataUrl} alt={attachment.name} key={attachment.id} />
                           ))}
                         </div>
                       ) : null}
 
                       <div className="message-text">
-                        {message.content || (message.streaming && <span className="stream-wait"><i /><i /><i /> {phaseLabel}</span>)}
+                        {message.content ? messageWithCitations(message) : (message.streaming && <span className="stream-wait"><i /><i /><i /> {phaseLabel}</span>)}
                         {message.streaming && message.content && <span className="stream-cursor" />}
                       </div>
 
@@ -1213,6 +1332,10 @@ function App() {
                           onOpen={openSource}
                         />
                       ) : null}
+
+                      {message.documentSources?.length && !message.streaming && !message.documentSources.some(source => message.content.includes(`[${source.name}`)) ? <div className="document-citations" aria-label="Document evidence">
+                        {message.documentSources.map(source => <button className="file-citation" key={`${source.documentId}:${source.page}`} onClick={() => void openDocument(source.documentId, source.page)}>{citationFor(source)}</button>)}
+                      </div> : null}
 
                       {message.role === "assistant" && message.content && !message.streaming && !message.error ? (
                         <div className="message-actions">
@@ -1252,21 +1375,22 @@ function App() {
               <div className="attachment-tray">
                 {attachments.map(attachment => (
                   <div className="attachment-preview" key={attachment.id}>
-                    <img src={attachment.dataUrl} alt={attachment.name} />
-                    <span>{attachment.name}</span>
-                    <button onClick={() => setAttachments(current => current.filter(item => item.id !== attachment.id))} aria-label={`Remove ${attachment.name}`}>
+                    {isDocument(attachment) ? <FileText size={22} /> : <img src={attachment.dataUrl} alt={attachment.name} />}
+                    <span title={attachment.warning || attachment.name}>{attachment.name}<small>{fileType(attachment.name)} · {compactSize(attachment.size)}</small></span>
+                    <button onClick={() => removeAttachment(attachment)} aria-label={`Remove ${attachment.name}`}>
                       <X size={12} />
                     </button>
                   </div>
                 ))}
               </div>
             )}
+            {importing && <div className="file-import-status" role="status"><span>Reading files locally…</span><button onClick={() => { abandonImport(); setComposerNotice("File import stopped."); focusRef.current?.claim(); }}>Cancel</button></div>}
 
             <div className={`composer ${busy ? "busy" : ""}`}>
               <input
                 ref={fileInputRef}
                 type="file"
-                accept="image/*"
+                accept={FILE_ACCEPT}
                 multiple
                 hidden
                 onChange={event => {
@@ -1274,7 +1398,7 @@ function App() {
                   event.target.value = "";
                 }}
               />
-              <button className="attach-button" onClick={() => fileInputRef.current?.click()} disabled={busy} aria-label="Attach image">
+              <button className="attach-button" onClick={() => fileInputRef.current?.click()} disabled={importing || updateStatus === "downloading"} aria-label="Attach files or images">
                 <Plus size={19} />
               </button>
               <textarea
@@ -1284,12 +1408,12 @@ function App() {
                 onKeyDown={handleComposerKeyDown}
                 placeholder="Ask anything…"
                 rows={1}
-                disabled={busy}
+                aria-label="Message composer"
               />
               <button
                 className={`web-toggle ${webForced ? "active" : ""} ${!webForced && autoWeb ? "auto" : ""}`}
                 onClick={() => setWebForced(current => !current)}
-                disabled={busy}
+                disabled={updateStatus === "downloading"}
                 aria-pressed={webForced}
                 title={webForced ? "Web search is on" : autoWeb ? "Web search will turn on automatically" : "Use web search"}
               >
@@ -1317,10 +1441,11 @@ function App() {
 
       {dragging && (
         <div className="drop-overlay">
-          <div><ImagePlus size={22} /><strong>Drop images here</strong><span>Up to four attachments</span></div>
+          <div><FileText size={22} /><strong>Drop files or images here</strong><span>Up to four attachments · processed locally</span></div>
         </div>
       )}
 
+      {reader && <DocumentReader document={reader.document} initialPage={reader.page} onClose={closeDocument} />}
       {settingsOpen && (
         <div className="settings-shade" onMouseDown={() => setSettingsOpen(false)}>
           <aside className="settings-panel" onMouseDown={event => event.stopPropagation()}>

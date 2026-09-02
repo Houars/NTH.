@@ -726,6 +726,29 @@ button:focus-visible, textarea:focus-visible, input:focus-visible {
 .attachment-preview span { max-width: 120px; overflow: hidden; color: #73736e; text-overflow: ellipsis; white-space: nowrap; font-size: 9px; }
 .attachment-preview button { width: 23px; height: 23px; display: grid; place-items: center; border: 0; border-radius: 6px; background: transparent; color: #666661; cursor: pointer; }
 .attachment-preview button:hover { background: #222224; color: #ddd; }
+.attachment-preview small { display: block; margin-top: 3px; color: var(--dim); font-size: 8px; }
+.attachment-preview > svg { margin: 6px; color: #b0b0aa; flex-shrink: 0; }
+.file-chip { display: flex; align-items: center; gap: 10px; max-width: 280px; padding: 10px 12px; border: 1px solid #29292b; border-radius: 10px; background: var(--panel-2); text-align: left; cursor: pointer; }
+.file-chip span { min-width: 0; }
+.file-chip strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-weight: 400; }
+.file-chip small { display: block; margin-top: 4px; color: var(--muted); font-size: 8px; }
+.file-chip:hover { background: var(--panel-3); }
+.file-citation { display: inline; border: 0; padding: 0 2px; background: transparent; color: #a9a9a3; font-size: .85em; cursor: pointer; text-decoration: underline; text-decoration-color: #444; text-underline-offset: 3px; }
+.file-citation:hover { color: var(--text); }
+.document-citations { display: flex; flex-wrap: wrap; gap: 6px 10px; margin-top: 9px; font-size: 11px; }
+.file-import-status { display: flex; align-items: center; gap: 12px; font-size: 10px; color: var(--muted); padding: 0 12px 8px; }
+.file-import-status button { border: 0; background: transparent; color: var(--text); cursor: pointer; }
+.document-reader { width: min(680px, 90vw); max-height: 82vh; padding: 0; border: 1px solid #333; border-radius: 14px; background: var(--panel); color: var(--text); overflow: hidden; }
+.document-reader::backdrop { background: #000a; }
+.document-reader header, .document-reader footer { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 20px; }
+.document-reader header strong { display: block; overflow-wrap: anywhere; font-size: 13px; font-weight: 500; }
+.document-reader header small { display: block; margin-top: 5px; color: var(--muted); font-size: 9px; }
+.document-reader button { display: inline-grid; place-items: center; width: 30px; height: 30px; background: transparent; color: var(--text); border: 1px solid var(--line); border-radius: 8px; cursor: pointer; }
+.document-reader button:disabled { opacity: .3; cursor: default; }
+.document-reader pre { margin: 0; padding: 20px; max-height: 53vh; min-height: 140px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.8 "Consolas", monospace; border-block: 1px solid var(--line); }
+.document-reader footer { color: var(--muted); font-size: 10px; }
+.document-reader footer div { display: flex; gap: 8px; }
+.document-warning { margin: 0; padding: 0 20px 14px; font-size: 11px; color: var(--muted); }
 .composer {
   width: min(790px, 100%);
   min-height: 58px;

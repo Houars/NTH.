@@ -100,12 +100,23 @@ function normalizeMessage(value: unknown, fallbackCreatedAt: number): UiMessage 
     ...message,
     content,
     id: typeof message.id === "string" ? message.id : crypto.randomUUID(),
-    route: ["local", "web", "vision", "vision+web"].includes(String(message.route)) ? message.route : undefined,
+    route: ["local", "web", "vision", "vision+web", "file", "file+web"].includes(String(message.route)) ? message.route : undefined,
     createdAt: Number(message.createdAt) || fallbackCreatedAt,
     error: message.error || rawError || interrupted,
     attachments: Array.isArray(message.attachments) ? message.attachments.filter(image =>
       image && typeof image.dataUrl === "string" && typeof image.mime === "string"
-    ).map(image => ({ ...image, id: image.id || crypto.randomUUID(), name: image.name || "Image" })) : undefined,
+    ).map(image => ({
+      ...image,
+      id: typeof image.id === "string" ? image.id : crypto.randomUUID(),
+      name: typeof image.name === "string" && image.name ? image.name : image.kind === "document" ? "Unavailable file" : "Image",
+      documentId: image.kind === "document" ? typeof image.documentId === "string" ? image.documentId : "unavailable" : undefined,
+      size: typeof image.size === "number" && image.size >= 0 ? image.size : undefined,
+      warning: typeof image.warning === "string" ? image.warning : undefined
+    })) : undefined,
+    documentSources: Array.isArray(message.documentSources) ? message.documentSources.filter(source =>
+      source && typeof source.documentId === "string" && typeof source.name === "string"
+      && Number.isInteger(source.page) && source.page > 0 && Number.isInteger(source.endPage) && source.endPage >= source.page
+    ) : undefined,
     sources: Array.isArray(message.sources) ? message.sources.filter(source =>
       source && typeof source.url === "string" && typeof source.title === "string"
       && typeof source.snippet === "string" && typeof source.domain === "string"

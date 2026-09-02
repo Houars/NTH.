@@ -24,6 +24,53 @@ Rust, and Ollama.
 - Cached Ollama/model health, on-demand SearXNG health, and in-place Retry
 - Cancellable, time-bounded search, verification, generation, and vision
 - Interrupted-response recovery and guarded atomic chat persistence
+- Local PDF/text/code attachments with conversation-scoped retrieval and page citations
+- Composer stays editable while answering, with intent-aware keyboard focus
+
+## Files & documents (0.6.0)
+
+Attach up to four images/files per message using the picker, drop, or clipboard
+files. PDFs, TXT, Markdown, JSON, CSV/TSV, and common source-code/config files are
+supported. Image attachments still use the existing vision pipeline.
+
+Documents are parsed and retrieved in a cancellable worker, entirely on-device.
+PDF.js and its font/CMap resources are bundled locally; no CDN or OCR is used.
+Limits: 20 MB/PDF, 2 MB/text file, 500 PDF pages, and 240,000 extracted characters
+per document. Password-protected, corrupt, empty, binary, and image-only PDFs
+receive readable errors. Mixed PDFs warn about pages without embedded text;
+embedded images are not automatically analyzed.
+
+The local IndexedDB cache transactionally stores a private copy, extracted pages,
+and chunks; chat JSON stores only references. Renaming/moving the original file
+does not remove NTH's copy. References remain with their chat across restarts and
+context compaction. Missing/damaged cache entries preserve the chat and ask for
+reattachment. Clearing/deleting a saved chat removes its associated file cache
+after the chat-history write succeeds. This is not a global file library.
+
+Follow-ups, filenames, and ordinal references such as “the second file” resolve
+against that conversation. Lexical/BM25-style retrieval selects excerpts within
+the existing 24,000-character context budget. Summaries process every extracted
+section in order before combining notes—never just the first matching chunks.
+Large summaries are capped at 24 local section passes and ten minutes total for
+those passes, with the existing 45-second per-call timeout and Stop support.
+Requests exceeding the limit ask you to summarize fewer files at once.
+
+FILE answers distinguish untrusted document evidence from general knowledge.
+Filename/page citations open a small local **extracted-text** reader at the
+relevant page; it is not a visual PDF renderer. Document-only recommendations
+stay local. Freshness comparisons or forced WEB use short public-topic queries
+through the existing search/verifier pipeline; document files are never uploaded.
+
+Enter and Send return focus to the composer, which accepts a next draft during
+generation (it is not queued or sent automatically). Shift+Enter stays multiline.
+Completion, Retry, and Stop respect intentional focus changes, text selection,
+Settings, and source interactions. Focus calls do not scroll the chat.
+
+Run `npm test` for deterministic regression tests. With Ollama running,
+`node scripts/smoke-documents.mjs` exercises real Gemma document follow-ups using
+synthetic files only. `tests/browser.html` is a development-only UI harness with
+synthetic PDF/text/error fixtures and a delayed mocked model (F8 completes a
+reply); it is not part of the production build.
 
 ## Reliability (0.5.9)
 

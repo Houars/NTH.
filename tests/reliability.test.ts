@@ -4,6 +4,7 @@ import { mockIPC, clearMocks } from "@tauri-apps/api/mocks";
 import { answerNth, classifyNthError, MODEL_BY_MODE } from "../src/lib/nth";
 import { createConversation, historyStorageKey, loadConversations, saveConversations } from "../src/lib/history";
 import { calculateAge, needsFreshWeb } from "../src/lib/context";
+import "./documents.test";
 
 globalThis.window = globalThis;
 let store: Map<string, string>;
