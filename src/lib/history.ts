@@ -1,8 +1,9 @@
-import type { NthMessage, Route, SearchSource } from "./nth";
-import { emptyTopicState, normalizeTopicState, type TopicState } from "./context";
+import type { NthFailureKind, NthMessage, Route, SearchSource } from "./nth";
+import { deriveTopicState, emptyTopicState, normalizeTopicState, type TopicState } from "./context";
 import {
   emptyConversationMemory,
   normalizeConversationMemory,
+  rebuildConversationMemory,
   type ConversationMemory
 } from "./memory";
 
@@ -15,6 +16,12 @@ export type UiMessage = NthMessage & {
   contextReused?: boolean;
   error?: boolean;
   streaming?: boolean;
+  failure?: {
+    kind: NthFailureKind;
+    userMessageId: string;
+    forceWeb: boolean;
+    retryCount: number;
+  };
 };
 
 export type Conversation = {
@@ -35,6 +42,16 @@ export type ConversationGroup = {
 const HISTORY_KEY = "nth.conversations.v1";
 const HISTORY_TEMP_KEY = "nth.conversations.v1.pending";
 const LEGACY_CHAT_KEY = "nth.chat.v2";
+let unreadableHistory = false;
+
+export function rebuildTopicState(messages: UiMessage[]): TopicState {
+  const stable = messages.filter(message => !message.error);
+  let context = emptyTopicState();
+  for (let index = 0; index < stable.length; index += 1) {
+    if (stable[index].role === "user") context = deriveTopicState(stable.slice(0, index + 1), context);
+  }
+  return context;
+}
 
 export function createConversation(now = Date.now()): Conversation {
   return {
@@ -54,8 +71,13 @@ function isConversation(value: unknown): value is Conversation {
   return typeof item.id === "string" && Array.isArray(item.messages);
 }
 
-function normalizeMessage(message: UiMessage, fallbackCreatedAt: number): UiMessage {
+function normalizeMessage(value: unknown, fallbackCreatedAt: number): UiMessage | null {
+  if (!value || typeof value !== "object") return null;
+  const message = value as UiMessage;
+  if (message.role !== "assistant" && message.role !== "user") return null;
+  if (typeof message.content !== "string") message.content = "";
   const rawError = message.role === "assistant" && /^error:/i.test(message.content.trim());
+  const interrupted = message.role === "assistant" && Boolean(message.streaming);
   let content = message.content;
 
   if (rawError) {
@@ -68,44 +90,88 @@ function normalizeMessage(message: UiMessage, fallbackCreatedAt: number): UiMess
     }
   }
 
+  if (interrupted) {
+    content = content.trim()
+      ? `${content.trim()}\n\nResponse interrupted. Retry?`
+      : "The previous operation was interrupted. Retry?";
+  }
+
   return {
     ...message,
     content,
-    id: message.id || crypto.randomUUID(),
+    id: typeof message.id === "string" ? message.id : crypto.randomUUID(),
+    route: ["local", "web", "vision", "vision+web"].includes(String(message.route)) ? message.route : undefined,
     createdAt: Number(message.createdAt) || fallbackCreatedAt,
-    error: message.error || rawError,
+    error: message.error || rawError || interrupted,
+    attachments: Array.isArray(message.attachments) ? message.attachments.filter(image =>
+      image && typeof image.dataUrl === "string" && typeof image.mime === "string"
+    ).map(image => ({ ...image, id: image.id || crypto.randomUUID(), name: image.name || "Image" })) : undefined,
+    sources: Array.isArray(message.sources) ? message.sources.filter(source =>
+      source && typeof source.url === "string" && typeof source.title === "string"
+      && typeof source.snippet === "string" && typeof source.domain === "string"
+    ) : undefined,
+    searchQuery: typeof message.searchQuery === "string" ? message.searchQuery : undefined,
+    failure: interrupted || message.error || rawError ? {
+      kind: interrupted ? "cancelled" : message.failure?.kind || "service",
+      userMessageId: typeof message.failure?.userMessageId === "string" ? message.failure.userMessageId : "",
+      forceWeb: typeof message.failure?.forceWeb === "boolean" ? message.failure.forceWeb : message.route === "web" || message.route === "vision+web",
+      retryCount: Math.max(0, Number(message.failure?.retryCount) || 0)
+    } : undefined,
     streaming: false
   };
 }
 
 function normalizeConversation(conversation: Conversation): Conversation {
   const createdAt = Number(conversation.createdAt) || Date.now();
-  const messages = conversation.messages.map(message => normalizeMessage(message, createdAt));
-  const context = normalizeTopicState(conversation.context);
+  let previousUserId = "";
+  const messages = conversation.messages.map(message => {
+    const normalized = normalizeMessage(message, createdAt);
+    if (!normalized) return null;
+    if (normalized.role === "user") previousUserId = normalized.id;
+    if (normalized.failure && !normalized.failure.userMessageId) {
+      normalized.failure = { ...normalized.failure, userMessageId: previousUserId };
+    }
+    return normalized;
+  }).filter((message): message is UiMessage => message !== null);
+  // Metadata is expendable; visible messages are not. Rebuild only damaged
+  // metadata and retain the v0.5.8 representation for healthy saved chats.
+  const rawContext = conversation.context;
+  const validContext = rawContext &&
+    [rawContext.currentExplicitSubject, rawContext.lastMeaningfulUserTopic, rawContext.currentWebSubject, rawContext.focus].every(item => typeof item === "string") &&
+    [rawContext.recentEntities, rawContext.recentVerifiedSubjects].every(items => Array.isArray(items) && items.every(item => typeof item === "string"));
+  const context = validContext ? normalizeTopicState(rawContext) : rebuildTopicState(messages);
+  let memory: ConversationMemory;
+  try {
+    memory = normalizeConversationMemory(conversation.memory, messages, context);
+  } catch {
+    memory = rebuildConversationMemory(messages, context);
+  }
   return {
     ...conversation,
-    title: conversation.title?.trim() || "New conversation",
+    title: typeof conversation.title === "string" && conversation.title.trim() ? conversation.title : "New conversation",
     createdAt,
     updatedAt: Number(conversation.updatedAt) || createdAt,
     messages,
     context,
-    memory: normalizeConversationMemory(conversation.memory, messages, context)
+    memory
   };
 }
 
 function readSavedConversations(key: string): Conversation[] {
   const saved = JSON.parse(localStorage.getItem(key) || "[]") as unknown;
-  if (!Array.isArray(saved)) return [];
+  if (!Array.isArray(saved)) throw new Error("Unreadable chat history");
   return saved.filter(isConversation).map(normalizeConversation);
 }
 
 export function loadConversations(): Conversation[] {
+  unreadableHistory = false;
   let primary: Conversation[] = [];
   let pending: Conversation[] = [];
   try {
     primary = readSavedConversations(HISTORY_KEY);
   } catch {
     // A broken history entry should never prevent NTH from starting.
+    unreadableHistory = true;
   }
 
   try {
@@ -117,6 +183,7 @@ export function loadConversations(): Conversation[] {
   if (primary.length || pending.length) {
     const newest = (items: Conversation[]) => Math.max(0, ...items.map(item => item.updatedAt));
     if (pending.length && newest(pending) > newest(primary)) {
+      unreadableHistory = false;
       try {
         localStorage.setItem(HISTORY_KEY, localStorage.getItem(HISTORY_TEMP_KEY) || "[]");
         localStorage.removeItem(HISTORY_TEMP_KEY);
@@ -143,7 +210,7 @@ export function loadConversations(): Conversation[] {
         title: titleForMessage(firstUser?.content || "Imported conversation", Boolean(firstUser?.attachments?.length)),
         createdAt: now,
         updatedAt: now,
-        messages: legacy.map(message => normalizeMessage(message, now)),
+        messages: legacy.map(message => normalizeMessage(message, now)).filter((message): message is UiMessage => message !== null),
         context: emptyTopicState(),
         memory: emptyConversationMemory()
       }];
@@ -155,19 +222,23 @@ export function loadConversations(): Conversation[] {
   return [createConversation()];
 }
 
-export function saveConversations(conversations: Conversation[]): void {
+export function saveConversations(conversations: Conversation[], explicitlyReplaceUnreadable = false): boolean {
+  // Never overwrite an unreadable original with a freshly-created empty chat.
+  // Keep it available for recovery; the UI reports that persistence is blocked.
+  if (unreadableHistory && !explicitlyReplaceUnreadable) return false;
   try {
-    const stable = conversations.map(conversation => ({
-      ...conversation,
-      messages: conversation.messages.map(({ streaming: _streaming, ...message }) => message)
-    }));
-    const serialized = JSON.stringify(stable);
+    // Persist the transient streaming marker. On the next startup it is turned
+    // into a recoverable interrupted response rather than a stale busy state.
+    const serialized = JSON.stringify(conversations);
     // One localStorage replacement is atomic in the WebView. Keeping a second
     // full copy would double quota pressure for chats containing pasted images.
     localStorage.setItem(HISTORY_KEY, serialized);
+    unreadableHistory = false;
     localStorage.removeItem(HISTORY_TEMP_KEY);
+    return true;
   } catch {
     // localStorage quotas vary. The active chat remains usable in memory.
+    return false;
   }
 }
 

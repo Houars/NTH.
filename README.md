@@ -21,6 +21,35 @@ Rust, and Ollama.
 - Per-topic verified WEB evidence memory with freshness-based expiry and restart restoration
 - Collapsed-by-default verified source cards
 - In-app settings and service status without developer-facing error dumps
+- Cached Ollama/model health, on-demand SearXNG health, and in-place Retry
+- Cancellable, time-bounded search, verification, generation, and vision
+- Interrupted-response recovery and guarded atomic chat persistence
+
+## Reliability (0.5.9)
+
+Ollama health and the exact configured model are checked at startup and at a
+30-second idle cadence. Retry refreshes the model check. Missing models are never
+silently replaced; Settings offers the exact install command. SearXNG is checked
+on demand and its failure does not block LOCAL conversations.
+
+Search retains its existing two-worker limit, six-second native request limit,
+and one transient retry, with a 25-second overall search budget. Generation and
+vision have 45-second limits; verification has a 40-second limit. Stop cancels
+active native requests and prevents queued work or late tokens from continuing.
+Retry replaces the failed assistant response without adding a second user turn.
+
+Chat snapshots use an atomic localStorage replacement. New turns and completed
+operations save immediately, streaming snapshots are throttled, and interrupted
+responses reopen as stopped, retryable entries. Damaged context metadata is
+rebuilt from visible messages. Unreadable history is retained rather than
+overwritten, and write failures are shown inside the app.
+
+The last 100 diagnostic events stay on this device under `nth.diagnostics.v1`
+and are available as `window.__NTH_DIAGNOSTICS__` after an event. They contain
+operation/status metadata, not prompts, answers, images, or telemetry.
+
+Run the regression checks with `npm test` and
+`cargo test --manifest-path src-tauri/Cargo.toml`.
 
 ## Protected AI behavior
 

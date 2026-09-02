@@ -2,7 +2,7 @@ use futures::future::join_all;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -32,7 +32,61 @@ pub enum StreamEvent {
 }
 
 #[derive(Default)]
-pub struct GenerationState(Mutex<HashMap<String, Arc<AtomicBool>>>);
+struct OperationRegistry {
+    active: HashMap<String, Vec<Arc<AtomicBool>>>,
+    cancelled: VecDeque<String>,
+}
+
+#[derive(Default)]
+pub struct OperationState(Mutex<OperationRegistry>);
+
+fn register_operation(
+    state: &OperationState,
+    operation_id: &str,
+) -> Result<Arc<AtomicBool>, String> {
+    let mut registry = state
+        .0
+        .lock()
+        .map_err(|_| "Operation state is unavailable.".to_string())?;
+    // Cancellation can arrive before an IPC request registers. A bounded
+    // tombstone prevents that late request from starting after the UI stopped.
+    if registry.cancelled.iter().any(|id| id == operation_id) {
+        return Err("Operation cancelled.".to_string());
+    }
+    let flag = Arc::new(AtomicBool::new(false));
+    registry
+        .active
+        .entry(operation_id.to_string())
+        .or_default()
+        .push(flag.clone());
+    Ok(flag)
+}
+
+fn unregister_operation(state: &OperationState, operation_id: &str, flag: &Arc<AtomicBool>) {
+    let Ok(mut operations) = state.0.lock() else {
+        return;
+    };
+    if let Some(flags) = operations.active.get_mut(operation_id) {
+        flags.retain(|candidate| !Arc::ptr_eq(candidate, flag));
+        if flags.is_empty() {
+            operations.active.remove(operation_id);
+        }
+    }
+}
+
+async fn wait_for_cancellation(cancelled: Arc<AtomicBool>) {
+    while !cancelled.load(Ordering::Relaxed) {
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    }
+}
+
+fn service_request_error(service: &str, error: reqwest::Error) -> String {
+    if error.is_timeout() {
+        format!("{service} request timed out.")
+    } else {
+        format!("{service} request failed: {error}")
+    }
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -46,8 +100,13 @@ pub struct UpdateInfo {
 #[derive(Debug, Serialize, Clone)]
 #[serde(tag = "event", content = "data", rename_all = "camelCase")]
 pub enum UpdateEvent {
-    Started { content_length: Option<u64> },
-    Progress { downloaded: u64, content_length: Option<u64> },
+    Started {
+        content_length: Option<u64>,
+    },
+    Progress {
+        downloaded: u64,
+        content_length: Option<u64>,
+    },
     Finished,
 }
 
@@ -68,7 +127,10 @@ async fn check_update(app: AppHandle) -> Result<Option<UpdateInfo>, String> {
         .build()
         .map_err(|error| error.to_string())?;
 
-    let update = updater.check().await.map_err(|error| error.to_string())?;
+    let update = tokio::time::timeout(std::time::Duration::from_secs(12), updater.check())
+        .await
+        .map_err(|_| "The signed update check timed out.".to_string())?
+        .map_err(|error| error.to_string())?;
     Ok(update.map(|update| UpdateInfo {
         current_version: update.current_version,
         version: update.version,
@@ -78,19 +140,18 @@ async fn check_update(app: AppHandle) -> Result<Option<UpdateInfo>, String> {
 }
 
 #[tauri::command]
-async fn install_update(
-    app: AppHandle,
-    on_event: Channel<UpdateEvent>,
-) -> Result<(), String> {
+async fn install_update(app: AppHandle, on_event: Channel<UpdateEvent>) -> Result<(), String> {
     let updater = app
         .updater_builder()
         .endpoints(vec![update_endpoint()?])
         .map_err(|error| error.to_string())?
         .build()
         .map_err(|error| error.to_string())?;
-    let update = updater
-        .check()
+    let update = tokio::time::timeout(std::time::Duration::from_secs(12), updater.check())
         .await
+        .map_err(|_| {
+            "The signed update check timed out. The installed version is unchanged.".to_string()
+        })?
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "NTH is already up to date.".to_string())?;
 
@@ -99,8 +160,9 @@ async fn install_update(
     let mut downloaded = 0_u64;
     let mut started = false;
 
-    update
-        .download_and_install(
+    tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        update.download_and_install(
             move |chunk_length, content_length| {
                 if !started {
                     started = true;
@@ -115,9 +177,13 @@ async fn install_update(
             move || {
                 let _ = finish_channel.send(UpdateEvent::Finished);
             },
-        )
-        .await
-        .map_err(|error| error.to_string())
+        ),
+    )
+    .await
+    .map_err(|_| {
+        "The update download timed out. The installed version was not replaced.".to_string()
+    })?
+    .map_err(|error| error.to_string())
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -619,13 +685,13 @@ async fn searx_request(
         .get(url)
         .send()
         .await
-        .map_err(|e| format!("SearXNG request failed: {e}"))?;
+        .map_err(|e| service_request_error("SearXNG", e))?;
 
     let status = response.status();
     let body = response
         .text()
         .await
-        .map_err(|e| format!("Could not read SearXNG response: {e}"))?;
+        .map_err(|e| service_request_error("SearXNG", e))?;
 
     if !status.is_success() {
         return Err(format!(
@@ -654,6 +720,77 @@ async fn ollama_ping() -> Result<bool, String> {
         .send()
         .await
         .map(|r| r.status().is_success())
+        .unwrap_or(false))
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OllamaHealth {
+    pub reachable: bool,
+    pub model_installed: bool,
+    pub expected_model: String,
+    pub installed_models: Vec<String>,
+}
+
+#[tauri::command]
+async fn ollama_health(model: String) -> Result<OllamaHealth, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(4))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let response = match client.get("http://127.0.0.1:11434/api/tags").send().await {
+        Ok(response) if response.status().is_success() => response,
+        _ => {
+            return Ok(OllamaHealth {
+                reachable: false,
+                model_installed: false,
+                expected_model: model,
+                installed_models: Vec::new(),
+            })
+        }
+    };
+    let payload: Value = response
+        .json()
+        .await
+        .map_err(|_| "Ollama returned an unreadable model list.".to_string())?;
+    let installed_models = payload["models"]
+        .as_array()
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|item| item["name"].as_str().or_else(|| item["model"].as_str()))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let expected = model.to_lowercase();
+    let model_installed = installed_models
+        .iter()
+        .any(|installed| installed.to_lowercase() == expected);
+    Ok(OllamaHealth {
+        reachable: true,
+        model_installed,
+        expected_model: model,
+        installed_models,
+    })
+}
+
+#[tauri::command]
+async fn searxng_ping(searxng_url: String) -> Result<bool, String> {
+    let client = reqwest::Client::builder()
+        .user_agent("NTH/0.5.9")
+        .timeout(std::time::Duration::from_secs(4))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let url = format!(
+        "{}/search?q=nth+health&format=json&safesearch=0",
+        searxng_url.trim_end_matches('/')
+    );
+    Ok(client
+        .get(url)
+        .send()
+        .await
+        .map(|response| response.status().is_success())
         .unwrap_or(false))
 }
 
@@ -789,16 +926,21 @@ async fn ollama_chat_stream_inner(
         }
     });
 
-    let response = client
+    let request = client
         .post("http://127.0.0.1:11434/api/chat")
         .json(&payload)
-        .send()
-        .await
-        .map_err(|e| format!("Ollama request failed: {e}"))?;
+        .send();
+    let response = tokio::select! {
+        response = request => response.map_err(|e| service_request_error("Ollama", e))?,
+        _ = wait_for_cancellation(cancelled.clone()) => return Err("Operation cancelled.".to_string()),
+    };
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = tokio::select! {
+            body = response.text() => body.unwrap_or_default(),
+            _ = wait_for_cancellation(cancelled.clone()) => return Err("Operation cancelled.".to_string()),
+        };
         return Err(format!(
             "Ollama returned {status}: {}",
             truncate_chars(&body, 400)
@@ -810,13 +952,19 @@ async fn ollama_chat_stream_inner(
     let mut content = String::new();
     let mut finished = false;
 
-    while let Some(chunk) = body.next().await {
-        if cancelled.load(Ordering::Relaxed) {
+    loop {
+        let next = tokio::select! {
+            chunk = body.next() => chunk,
+            _ = wait_for_cancellation(cancelled.clone()) => None,
+        };
+        let Some(chunk) = next else {
             break;
-        }
-
-        let chunk = chunk.map_err(|e| format!("Ollama stream failed: {e}"))?;
+        };
+        let chunk = chunk.map_err(|e| service_request_error("Ollama", e))?;
         buffer.extend_from_slice(&chunk);
+        if buffer.len() > 2 * 1024 * 1024 {
+            return Err("Ollama returned an oversized stream frame.".to_string());
+        }
 
         while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
             let mut line: Vec<u8> = buffer.drain(..=newline).collect();
@@ -847,7 +995,8 @@ async fn ollama_chat_stream_inner(
     }
 
     if !cancelled.load(Ordering::Relaxed) && !buffer.is_empty() && !finished {
-        let (token, _) = parse_ollama_stream_line(&buffer)?;
+        let (token, done) = parse_ollama_stream_line(&buffer)?;
+        finished = done;
         if !token.is_empty() {
             content.push_str(&token);
             on_event
@@ -858,6 +1007,8 @@ async fn ollama_chat_stream_inner(
 
     if cancelled.load(Ordering::Relaxed) {
         let _ = on_event.send(StreamEvent::Stopped);
+    } else if !finished {
+        return Err("Ollama stream was interrupted before completion.".to_string());
     } else {
         let _ = on_event.send(StreamEvent::Done);
     }
@@ -869,7 +1020,7 @@ async fn ollama_chat_stream_inner(
 
 #[tauri::command]
 async fn ollama_chat_stream(
-    state: State<'_, GenerationState>,
+    state: State<'_, OperationState>,
     model: String,
     policy: String,
     messages: Vec<ChatMessage>,
@@ -877,42 +1028,56 @@ async fn ollama_chat_stream(
     generation_id: String,
     on_event: Channel<StreamEvent>,
 ) -> Result<ChatReply, String> {
-    let cancelled = Arc::new(AtomicBool::new(false));
-    state
-        .0
-        .lock()
-        .map_err(|_| "Generation state is unavailable.".to_string())?
-        .insert(generation_id.clone(), cancelled.clone());
+    let cancelled = register_operation(&state, &generation_id)?;
 
-    let result =
-        ollama_chat_stream_inner(model, policy, messages, max_tokens, on_event, cancelled).await;
+    let result = ollama_chat_stream_inner(
+        model,
+        policy,
+        messages,
+        max_tokens,
+        on_event,
+        cancelled.clone(),
+    )
+    .await;
 
-    if let Ok(mut generations) = state.0.lock() {
-        generations.remove(&generation_id);
-    }
+    unregister_operation(&state, &generation_id, &cancelled);
 
     result
 }
 
 #[tauri::command]
-fn cancel_generation(state: State<'_, GenerationState>, generation_id: String) -> bool {
-    let Ok(generations) = state.0.lock() else {
+fn cancel_operation(state: State<'_, OperationState>, operation_id: String) -> bool {
+    cancel_registered_operation(&state, &operation_id)
+}
+
+fn cancel_registered_operation(state: &OperationState, operation_id: &str) -> bool {
+    let Ok(mut operations) = state.0.lock() else {
         return false;
     };
-
-    if let Some(cancelled) = generations.get(&generation_id) {
-        cancelled.store(true, Ordering::Relaxed);
-        true
-    } else {
-        false
+    if !operations.cancelled.iter().any(|id| id == operation_id) {
+        operations.cancelled.push_back(operation_id.to_string());
+        if operations.cancelled.len() > 128 {
+            operations.cancelled.pop_front();
+        }
     }
+    if let Some(flags) = operations.active.get(operation_id) {
+        for cancelled in flags {
+            cancelled.store(true, Ordering::Relaxed);
+        }
+    }
+    true
 }
 
 #[tauri::command]
-async fn searxng_smart_search(
+fn cancel_generation(state: State<'_, OperationState>, generation_id: String) -> bool {
+    cancel_operation(state, generation_id)
+}
+
+async fn searxng_smart_search_inner(
     query: String,
     searxng_url: String,
     max_sources: Option<usize>,
+    cancelled: Arc<AtomicBool>,
 ) -> Result<SearchBundle, String> {
     let max_sources = max_sources.unwrap_or(6).clamp(4, 8);
 
@@ -936,7 +1101,10 @@ async fn searxng_smart_search(
         .cloned()
         .map(|q| searx_request(client.clone(), searxng_url.clone(), q, intent));
 
-    let responses = join_all(tasks).await;
+    let responses = tokio::select! {
+        responses = join_all(tasks) => responses,
+        _ = wait_for_cancellation(cancelled) => return Err("Operation cancelled.".to_string()),
+    };
 
     let mut ranked: Vec<(i32, SearchSource)> = Vec::new();
     let mut seen_urls = HashSet::new();
@@ -1089,22 +1257,111 @@ async fn searxng_smart_search(
     })
 }
 
+#[tauri::command]
+async fn searxng_smart_search(
+    state: State<'_, OperationState>,
+    query: String,
+    searxng_url: String,
+    max_sources: Option<usize>,
+    operation_id: String,
+) -> Result<SearchBundle, String> {
+    let cancelled = register_operation(&state, &operation_id)?;
+    let result =
+        searxng_smart_search_inner(query, searxng_url, max_sources, cancelled.clone()).await;
+    unregister_operation(&state, &operation_id, &cancelled);
+    result
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
-        .manage(GenerationState::default())
+        .manage(OperationState::default())
         .invoke_handler(tauri::generate_handler![
             ollama_ping,
+            ollama_health,
+            searxng_ping,
             ollama_chat,
             ollama_chat_stream,
             cancel_generation,
+            cancel_operation,
             searxng_smart_search,
             check_update,
             install_update
         ])
         .run(tauri::generate_context!())
         .expect("error while running NTH");
+}
+
+#[cfg(test)]
+mod reliability_tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_covers_all_children_and_blocks_late_registration() {
+        let state = OperationState::default();
+        let first = register_operation(&state, "request").unwrap();
+        let second = register_operation(&state, "request").unwrap();
+        assert!(cancel_registered_operation(&state, "request"));
+        assert!(first.load(Ordering::Relaxed));
+        assert!(second.load(Ordering::Relaxed));
+        unregister_operation(&state, "request", &first);
+        unregister_operation(&state, "request", &second);
+        assert!(register_operation(&state, "request").is_err());
+        assert!(register_operation(&state, "next-request").is_ok());
+    }
+
+    #[test]
+    fn cancellation_before_dispatch_is_retained_and_registry_is_bounded() {
+        let state = OperationState::default();
+        for index in 0..256 {
+            cancel_registered_operation(&state, &format!("request-{index}"));
+        }
+        assert_eq!(state.0.lock().unwrap().cancelled.len(), 128);
+        assert!(register_operation(&state, "request-255").is_err());
+    }
+
+    #[test]
+    fn streaming_parser_handles_completion_errors_and_corruption() {
+        assert_eq!(
+            parse_ollama_stream_line(br#"{"message":{"content":"Hello"},"done":false}"#).unwrap(),
+            ("Hello".to_string(), false)
+        );
+        assert!(parse_ollama_stream_line(br#"{"done":true}"#).unwrap().1);
+        assert!(parse_ollama_stream_line(br#"{"error":"model not found"}"#).is_err());
+        assert!(parse_ollama_stream_line(b"{invalid").is_err());
+    }
+
+    #[test]
+    fn useful_aggregate_results_survive_engine_captcha_failures() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let query = "newest NVIDIA GPU".to_string();
+        let count = build_search_queries(&query, detect_intent(&query)).len();
+        let server = std::thread::spawn(move || {
+            for _ in 0..count {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                    .unwrap();
+                let mut buffer = [0_u8; 4096];
+                let _ = socket.read(&mut buffer);
+                let body = r#"{"results":[{"title":"NVIDIA GPU","url":"https://www.nvidia.com/gpu","content":"NVIDIA GPU product information","engine":"brave"}],"unresponsive_engines":[["bing","CAPTCHA"]]}"#;
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            }
+        });
+        let result = tauri::async_runtime::block_on(searxng_smart_search_inner(
+            query,
+            endpoint,
+            Some(6),
+            Arc::new(AtomicBool::new(false)),
+        ))
+        .unwrap();
+        server.join().unwrap();
+        assert!(!result.sources.is_empty());
+        assert!(!result.engine_warnings.is_empty());
+    }
 }

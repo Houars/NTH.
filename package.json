@@ -1,9 +1,10 @@
 {
   "name": "nth",
   "private": true,
-  "version": "0.5.8",
+  "version": "0.5.9",
   "type": "module",
   "scripts": {
+    "test": "node scripts/test.mjs",
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",

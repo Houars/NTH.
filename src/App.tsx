@@ -43,10 +43,13 @@ import {
   answerNth,
   type AnswerPhase,
   type Attachment,
+  checkOllamaHealth,
+  classifyNthError,
   MODEL_BY_MODE,
   needsWeb,
   type NthMode,
-  pingOllama,
+  type OllamaHealth,
+  pingSearXNG,
   type Route,
   type SearchSource
 } from "./lib/nth";
@@ -55,6 +58,7 @@ import {
   groupConversations,
   loadConversations,
   relativeTime,
+  rebuildTopicState,
   saveConversations,
   titleForMessage,
   type Conversation,
@@ -67,6 +71,7 @@ import {
   installNthUpdate,
   type NthUpdateInfo
 } from "./lib/updater";
+import { logDiagnostic } from "./lib/diagnostics";
 
 const SETTINGS_KEY = "nth.settings.v2";
 const MODE_KEY = "nth.mode.v1";
@@ -84,6 +89,18 @@ const defaultSettings: SettingsState = {
 
 type UpdateStatus = "idle" | "checking" | "current" | "available" | "downloading" | "error";
 type GlyphState = "idle" | "thinking" | "generating" | "web" | "vision" | "error" | "offline";
+type OperationState = "idle" | AnswerPhase | "cancelled" | "error";
+
+const ACTIVE_OPERATIONS = new Set<OperationState>([
+  "resolving_context",
+  "searching",
+  "verifying",
+  "generating",
+  "vision"
+]);
+const CHAT_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+const MAX_CHAT_IMAGE_BYTES = 12 * 1024 * 1024;
+const MAX_CHAT_IMAGE_PIXELS = 32_000_000;
 
 const NTH_GLYPH_DOTS = [
   "100011111110001",
@@ -114,6 +131,7 @@ function loadSettings(): SettingsState {
     const saved = { ...defaultSettings, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}") } as SettingsState;
     return {
       ...saved,
+      searxngUrl: typeof saved.searxngUrl === "string" ? saved.searxngUrl : defaultSettings.searxngUrl,
       profileAvatar: typeof saved.profileAvatar === "string" && saved.profileAvatar.startsWith("data:image/")
         ? saved.profileAvatar
         : ""
@@ -124,8 +142,10 @@ function loadSettings(): SettingsState {
 }
 
 function loadMode(): NthMode {
-  const saved = localStorage.getItem(MODE_KEY);
-  return modes.includes(saved as NthMode) ? saved as NthMode : "RUN";
+  try {
+    const saved = localStorage.getItem(MODE_KEY);
+    return modes.includes(saved as NthMode) ? saved as NthMode : "RUN";
+  } catch { return "RUN"; }
 }
 
 function dataUrlFor(file: File): Promise<string> {
@@ -173,22 +193,43 @@ async function avatarDataUrlFor(file: File): Promise<string> {
   return canvas.toDataURL("image/webp", 0.88);
 }
 
-function friendlyError(error: unknown): string {
-  const raw = error instanceof Error ? error.message : String(error);
-  if (/searxng|searches failed|search query/i.test(raw)) {
-    return "Web search could not reach your local SearXNG service. Check its URL in Settings and try again.";
+async function chatAttachmentFor(file: File): Promise<Attachment> {
+  if (!CHAT_IMAGE_TYPES.has(file.type)) {
+    throw new Error("Use a PNG, JPEG, WebP, or GIF image.");
   }
-  if (/ollama|11434|connection refused|failed to fetch/i.test(raw)) {
-    return "Ollama is unavailable. Start Ollama, confirm the local model is installed, and try again.";
+  if (!file.size || file.size > MAX_CHAT_IMAGE_BYTES) {
+    throw new Error("Use an image smaller than 12 MB.");
   }
-  if (/decode|json/i.test(raw)) {
-    return "NTH received an unexpected local service response. Check Ollama and SearXNG, then try again.";
+
+  const dataUrl = await dataUrlFor(file);
+  const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+    const element = new Image();
+    const timer = window.setTimeout(() => reject(new Error("Image validation timed out.")), 8_000);
+    element.onload = () => {
+      window.clearTimeout(timer);
+      resolve(element);
+    };
+    element.onerror = () => {
+      window.clearTimeout(timer);
+      reject(new Error("That image is corrupt or unsupported."));
+    };
+    element.src = dataUrl;
+  });
+  const pixels = image.naturalWidth * image.naturalHeight;
+  if (!pixels || pixels > MAX_CHAT_IMAGE_PIXELS || image.naturalWidth > 8192 || image.naturalHeight > 8192) {
+    throw new Error("That image is too large to process safely.");
   }
-  return "NTH could not finish that response. Please try again.";
+
+  return {
+    id: crypto.randomUUID(),
+    name: file.name || "pasted-image.png",
+    mime: file.type,
+    dataUrl
+  };
 }
 
 function predictedRoute(text: string, hasVision: boolean, forceWeb: boolean, context: UiMessage[] = []): Route {
-  const useWeb = !isConversationHistoryIntent(text) && (forceWeb || needsWeb(text, context));
+  const useWeb = !isConversationHistoryIntent(text) && (forceWeb || needsWeb(text, context.filter(message => !message.error)));
   if (hasVision && useWeb) return "vision+web";
   if (hasVision) return "vision";
   if (useWeb) return "web";
@@ -250,7 +291,7 @@ function glyphStateFor(message: UiMessage, phase: AnswerPhase | null, ready: boo
   if (!ready) return "offline";
   if (!message.streaming) return "idle";
   if (phase === "searching") return "web";
-  if (!message.content && message.route?.includes("vision")) return "vision";
+  if (phase === "vision") return "vision";
   if (message.content) return "generating";
   return "thinking";
 }
@@ -280,10 +321,11 @@ function App() {
   const [mode, setMode] = useState<NthMode>(loadMode);
   const [settings, setSettings] = useState<SettingsState>(loadSettings);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
-  const [ready, setReady] = useState(false);
+  const [ollamaHealth, setOllamaHealth] = useState<OllamaHealth | null>(null);
   const [checkingStatus, setCheckingStatus] = useState(true);
-  const [busy, setBusy] = useState(false);
-  const [phase, setPhase] = useState<AnswerPhase | null>(null);
+  const [searxngOnline, setSearxngOnline] = useState<boolean | null>(null);
+  const [checkingWebStatus, setCheckingWebStatus] = useState(false);
+  const [operation, setOperation] = useState<OperationState>("idle");
   const [webForced, setWebForced] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [clearConfirm, setClearConfirm] = useState(false);
@@ -294,7 +336,8 @@ function App() {
   const [maximized, setMaximized] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [composerNotice, setComposerNotice] = useState("");
-  const [appVersion, setAppVersion] = useState("0.5.8");
+  const [storageNotice, setStorageNotice] = useState("");
+  const [appVersion, setAppVersion] = useState("0.5.9");
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("idle");
   const [updateInfo, setUpdateInfo] = useState<NthUpdateInfo | null>(null);
   const [updateMessage, setUpdateMessage] = useState("NTH checks the signed release channel automatically.");
@@ -307,6 +350,13 @@ function App() {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const chatRef = useRef<HTMLElement | null>(null);
   const generationRef = useRef<AbortController | null>(null);
+  const submissionRef = useRef(false);
+  const lastSubmissionAtRef = useRef(0);
+  const updateBusyRef = useRef(false);
+  const conversationsRef = useRef(conversations);
+  conversationsRef.current = conversations;
+  const persistenceRef = useRef({ at: 0, structure: "" });
+  const healthRef = useRef<{ health: OllamaHealth; checkedAt: number } | null>(null);
   const dragDepthRef = useRef(0);
 
   const activeConversation = useMemo(
@@ -315,8 +365,11 @@ function App() {
   );
   const messages = activeConversation?.messages || [];
   const groups = useMemo(() => groupConversations(conversations), [conversations]);
-  const autoWeb = needsWeb(input, messages);
-  const canSend = ready && !busy && Boolean(input.trim() || attachments.length);
+  const autoWeb = needsWeb(input, messages.filter(message => !message.error));
+  const ready = Boolean(ollamaHealth?.reachable && ollamaHealth.modelInstalled);
+  const busy = ACTIVE_OPERATIONS.has(operation);
+  const phase = busy ? operation as AnswerPhase : null;
+  const canSend = !busy && updateStatus !== "downloading" && Boolean(input.trim() || attachments.length);
 
   async function chooseAvatar(file?: File) {
     if (!file) return;
@@ -335,16 +388,48 @@ function App() {
   }, [activeConversation, conversations]);
 
   useEffect(() => {
-    const timer = window.setTimeout(() => saveConversations(conversations), 250);
+    const structure = conversations.map(chat => `${chat.id}:${chat.messages.length}:${chat.messages.some(message => message.streaming)}`).join("|");
+    const elapsed = Date.now() - persistenceRef.current.at;
+    const persist = () => {
+      persistChats();
+      persistenceRef.current = { at: Date.now(), structure };
+    };
+    // Save new turns immediately; throttle (don't debounce) continuous tokens.
+    if (structure !== persistenceRef.current.structure || elapsed >= 500) {
+      persist();
+      return;
+    }
+    const timer = window.setTimeout(persist, 500 - elapsed);
     return () => window.clearTimeout(timer);
   }, [conversations]);
 
+  function persistChats(): boolean {
+    const saved = saveConversations(conversationsRef.current);
+    setStorageNotice(saved ? "" : "Chats could not be saved. Keep NTH open and check local storage.");
+    if (!saved) logDiagnostic({ operation: "save_chats", serviceFailure: "persistence", errorClass: "StorageWriteFailed" });
+    return saved;
+  }
+
   useEffect(() => {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+    const flush = () => { saveConversations(conversationsRef.current); };
+    window.addEventListener("beforeunload", flush);
+    return () => window.removeEventListener("beforeunload", flush);
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+    } catch {
+      logDiagnostic({ operation: "save_settings", serviceFailure: "persistence", errorClass: "StorageWriteFailed" });
+    }
   }, [settings]);
 
   useEffect(() => {
-    localStorage.setItem(MODE_KEY, mode);
+    try {
+      localStorage.setItem(MODE_KEY, mode);
+    } catch {
+      logDiagnostic({ operation: "save_mode", serviceFailure: "persistence", errorClass: "StorageWriteFailed" });
+    }
   }, [mode]);
 
   useEffect(() => {
@@ -362,14 +447,54 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function refreshOllamaStatus() {
+  async function refreshOllamaStatus(): Promise<OllamaHealth> {
     setCheckingStatus(true);
-    const online = await pingOllama().catch(() => false);
-    setReady(online);
+    const started = performance.now();
+    let health: OllamaHealth;
+    try {
+      health = await checkOllamaHealth(MODEL_BY_MODE[mode]);
+    } catch {
+      health = { reachable: false, modelInstalled: false, expectedModel: MODEL_BY_MODE[mode], installedModels: [] };
+    }
+    healthRef.current = { health, checkedAt: Date.now() };
+    setOllamaHealth(health);
     setCheckingStatus(false);
+    logDiagnostic({
+      operation: "health_ollama",
+      durationMs: Math.round(performance.now() - started),
+      serviceFailure: health.reachable ? health.modelInstalled ? undefined : "model" : "ollama",
+      errorClass: health.reachable ? health.modelInstalled ? undefined : "MissingModel" : "ServiceUnavailable"
+    });
+    return health;
+  }
+
+  async function ensureOllamaReady(force = false): Promise<OllamaHealth> {
+    const cached = healthRef.current;
+    const health = !force && cached && Date.now() - cached.checkedAt < 30_000
+      ? cached.health
+      : await refreshOllamaStatus();
+    if (!health.reachable) throw new Error("Ollama unavailable.");
+    if (!health.modelInstalled) throw new Error(`Model missing: ${health.expectedModel}`);
+    return health;
+  }
+
+  async function refreshSearXNGStatus() {
+    if (checkingWebStatus) return;
+    setCheckingWebStatus(true);
+    const started = performance.now();
+    const online = await pingSearXNG(settings.searxngUrl).catch(() => false);
+    setSearxngOnline(online);
+    setCheckingWebStatus(false);
+    logDiagnostic({
+      operation: "health_searxng",
+      durationMs: Math.round(performance.now() - started),
+      serviceFailure: online ? undefined : "searxng",
+      errorClass: online ? undefined : "ServiceUnavailable"
+    });
   }
 
   async function refreshUpdate() {
+    if (updateBusyRef.current) return;
     const inTauri = Boolean((window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__);
     if (!inTauri) {
       setUpdateStatus("error");
@@ -377,6 +502,7 @@ function App() {
       return;
     }
 
+    updateBusyRef.current = true;
     setUpdateStatus("checking");
     setUpdateMessage("Checking the signed release channel…");
     try {
@@ -391,53 +517,76 @@ function App() {
       }
     } catch (error) {
       setUpdateStatus("error");
-      const raw = error instanceof Error ? error.message : String(error);
-      setUpdateMessage(/https/i.test(raw) ? raw : "The signed release channel could not be reached. Try again shortly.");
+      setUpdateMessage("The signed release channel could not be reached. NTH is still usable; try again shortly.");
+      logDiagnostic({ operation: "check_update", serviceFailure: "updater", errorClass: error instanceof Error ? error.name : "UpdateError" });
+    } finally {
+      updateBusyRef.current = false;
     }
   }
 
   async function applyUpdate() {
-    if (!updateInfo || updateStatus === "downloading") return;
+    if (!updateInfo || updateBusyRef.current || busy || submissionRef.current) return;
+    if (!persistChats()) {
+      setUpdateMessage("Save recovery is needed before updating. Your current app remains open.");
+      return;
+    }
+    updateBusyRef.current = true;
     setUpdateStatus("downloading");
     setUpdatePercent(0);
     setUpdateMessage(`Downloading NTH ${updateInfo.version}…`);
 
+    let installed = false;
     try {
       await installNthUpdate(progress => {
         setUpdatePercent(progress.percent ?? null);
         setUpdateMessage(progress.finished
-          ? "Update verified. Restarting NTH…"
+          ? "Download complete. Verifying and installing…"
           : progress.percent === undefined
             ? "Downloading and verifying the signed update…"
             : `Downloading update… ${progress.percent}%`);
       });
+      installed = true;
       await relaunch();
     } catch (error) {
       setUpdateStatus("error");
       setUpdatePercent(null);
       const raw = error instanceof Error ? error.message : String(error);
-      setUpdateMessage(/signature/i.test(raw)
+      setUpdateMessage(installed
+        ? "Update installed. Close and reopen NTH to finish."
+        : /signature/i.test(raw)
         ? "The update signature could not be verified, so NTH refused to install it."
-        : "NTH could not install that update. Check the release channel and try again.");
+        : "The update could not finish. NTH is still usable; try checking again.");
+      logDiagnostic({ operation: "install_update", serviceFailure: "updater", errorClass: error instanceof Error ? error.name : "UpdateError" });
+    } finally {
+      updateBusyRef.current = false;
     }
   }
 
   useEffect(() => {
     let alive = true;
+    healthRef.current = null;
     const check = async () => {
-      const online = await pingOllama().catch(() => false);
-      if (alive) {
-        setReady(online);
-        setCheckingStatus(false);
-      }
+      if (!alive || submissionRef.current) return;
+      await refreshOllamaStatus();
     };
     void check();
-    const timer = window.setInterval(check, 7000);
+    const timer = window.setInterval(check, 30_000);
     return () => {
       alive = false;
       window.clearInterval(timer);
     };
-  }, []);
+  // Health is cached and checked at a low cadence; requests force a check after failures.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode]);
+
+  useEffect(() => {
+    if (settingsOpen && searxngOnline === null) void refreshSearXNGStatus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settingsOpen]);
+
+  useEffect(() => {
+    setSearxngOnline(null);
+  }, [settings.searxngUrl]);
 
   useEffect(() => {
     const inTauri = Boolean((window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__);
@@ -488,7 +637,7 @@ function App() {
 
   useEffect(() => {
     const scroller = chatRef.current;
-    if (!scroller || (!atBottom && !busy)) return;
+    if (!scroller || !atBottom) return;
     const frame = window.requestAnimationFrame(() => {
       scroller.scrollTo({ top: scroller.scrollHeight, behavior: busy ? "auto" : "smooth" });
     });
@@ -500,9 +649,10 @@ function App() {
   }
 
   async function addFiles(files: File[]) {
-    const images = files.filter(file => file.type.startsWith("image/"));
+    if (!files.length) return;
+    const images = files.filter(file => CHAT_IMAGE_TYPES.has(file.type));
     if (!images.length) {
-      setComposerNotice("NTH accepts image attachments.");
+      setComposerNotice("Use a PNG, JPEG, WebP, or GIF image.");
       window.setTimeout(() => setComposerNotice(""), 2200);
       return;
     }
@@ -514,12 +664,15 @@ function App() {
       return;
     }
 
-    const next = await Promise.all(images.slice(0, room).map(async file => ({
-      id: crypto.randomUUID(),
-      name: file.name || "pasted-image.png",
-      mime: file.type || "image/png",
-      dataUrl: await dataUrlFor(file)
-    })));
+    const settled = await Promise.allSettled(images.slice(0, room).map(chatAttachmentFor));
+    const next = settled.flatMap(result => result.status === "fulfilled" ? [result.value] : []);
+    const failed = settled.find(result => result.status === "rejected");
+    if (failed?.status === "rejected") {
+      const message = failed.reason instanceof Error ? failed.reason.message : "NTH could not read that image.";
+      setComposerNotice(message);
+      window.setTimeout(() => setComposerNotice(""), 3200);
+      logDiagnostic({ operation: "validate_vision", serviceFailure: "vision", errorClass: "InvalidImage" });
+    }
     setAttachments(current => [...current, ...next].slice(0, 4));
     textareaRef.current?.focus();
   }
@@ -568,6 +721,10 @@ function App() {
   function clearHistory() {
     if (busy) return;
     const replacement = createConversation();
+    if (!saveConversations([replacement], true)) {
+      setStorageNotice("Chat history could not be cleared. Check local storage and try again.");
+      return;
+    }
     setConversations([replacement]);
     setActiveId(replacement.id);
     setInput("");
@@ -576,53 +733,38 @@ function App() {
     setSettingsOpen(false);
   }
 
-  async function send() {
-    if (!canSend || !activeConversation) return;
-
-    const conversationId = activeConversation.id;
-    const text = input.trim() || "Describe this image.";
-    const sentAttachments = attachments;
-    const userMessage: UiMessage = {
-      id: crypto.randomUUID(),
-      role: "user",
-      content: text,
-      attachments: sentAttachments,
-      createdAt: Date.now()
-    };
-    const assistantId = crypto.randomUUID();
-    const route = predictedRoute(text, Boolean(sentAttachments.length), webForced, messages);
-    const assistantMessage: UiMessage = {
-      id: assistantId,
-      role: "assistant",
-      content: "",
-      route,
-      createdAt: Date.now(),
-      streaming: true
-    };
-    const requestMessages = [...messages, userMessage];
-    const requestTopicState = deriveTopicState(requestMessages, activeConversation.context);
-    const requestMemory = rebuildConversationMemory(requestMessages, requestTopicState, activeConversation.memory);
-    const hasPriorUserMessage = messages.some(message => message.role === "user");
-
-    updateConversation(conversationId, conversation => ({
-      ...conversation,
-      context: requestTopicState,
-      memory: requestMemory,
-      title: hasPriorUserMessage ? conversation.title : titleForMessage(text, Boolean(sentAttachments.length)),
-      updatedAt: Date.now(),
-      messages: [...conversation.messages, userMessage, assistantMessage]
-    }));
-
-    setInput("");
-    setAttachments([]);
-    setBusy(true);
-    setPhase(null);
-    setAtBottom(true);
+  async function executeRequest({
+    conversationId,
+    userMessage,
+    assistantId,
+    requestMessages,
+    requestTopicState,
+    requestMemory,
+    forceWeb,
+    retryCount
+  }: {
+    conversationId: string;
+    userMessage: UiMessage;
+    assistantId: string;
+    requestMessages: UiMessage[];
+    requestTopicState: NonNullable<Conversation["context"]>;
+    requestMemory: NonNullable<Conversation["memory"]>;
+    forceWeb: boolean;
+    retryCount: number;
+  }) {
+    const operationId = crypto.randomUUID();
     const controller = new AbortController();
+    const started = performance.now();
+    const progress: { phase: AnswerPhase } = { phase: "resolving_context" };
+    const predicted = predictedRoute(userMessage.content, Boolean(userMessage.attachments?.length), forceWeb, requestMessages.slice(0, -1));
     generationRef.current = controller;
+    setOperation("resolving_context");
+    setAtBottom(true);
 
     try {
+      await ensureOllamaReady(retryCount > 0);
       const result = await answerNth({
+        operationId,
         messages: requestMessages
           .filter(message => !message.error)
           .map(({ role, content, attachments: images, route: messageRoute, sources, searchQuery, contextReused, createdAt }) => ({
@@ -636,12 +778,15 @@ function App() {
             createdAt
           })),
         mode,
-        forceWeb: webForced,
+        forceWeb,
         web: { searxngUrl: settings.searxngUrl },
         topicState: requestTopicState,
         memory: requestMemory,
         signal: controller.signal,
-        onPhase: nextPhase => setPhase(nextPhase),
+        onPhase: nextPhase => {
+          progress.phase = nextPhase;
+          setOperation(nextPhase);
+        },
         onToken: token => {
           updateConversation(conversationId, conversation => ({
             ...conversation,
@@ -663,44 +808,168 @@ function App() {
                 sources: result.sources,
                 searchQuery: result.searchQuery,
                 contextReused: result.contextReused,
-                streaming: false
+                streaming: false,
+                error: false,
+                failure: undefined
               }
             : message
         );
+        const replyIndex = nextMessages.findIndex(message => message.id === assistantId);
+        const hasLaterTurn = nextMessages.slice(replyIndex + 1).some(message => message.role === "user");
+        const context = hasLaterTurn ? rebuildTopicState(nextMessages) : result.topicState;
         return {
           ...conversation,
-          context: result.topicState,
-          memory: rebuildConversationMemory(nextMessages, result.topicState, conversation.memory),
+          context,
+          memory: rebuildConversationMemory(nextMessages, context, conversation.memory),
           updatedAt: Date.now(),
           messages: nextMessages
         };
+      });
+      setOperation("idle");
+      logDiagnostic({
+        operation: "answer",
+        route: result.route,
+        durationMs: Math.round(performance.now() - started),
+        retryCount
       });
       if (import.meta.env.DEV) {
         (window as Window & { __NTH_CONTEXT_DEBUG__?: unknown }).__NTH_CONTEXT_DEBUG__ = result.diagnostics;
       }
     } catch (error) {
-      const stopped = error instanceof DOMException && error.name === "AbortError";
-      updateConversation(conversationId, conversation => {
-        const nextMessages = conversation.messages.map(message => {
+      const failure = classifyNthError(controller.signal.aborted ? new DOMException("Operation cancelled", "AbortError") : error, MODEL_BY_MODE[mode], Boolean(userMessage.attachments?.length));
+      updateConversation(conversationId, conversation => ({
+        ...conversation,
+        updatedAt: Date.now(),
+        messages: conversation.messages.map(message => {
           if (message.id !== assistantId) return message;
-          if (stopped) {
-            return { ...message, content: message.content || "Generation stopped.", streaming: false };
-          }
-          return { ...message, content: friendlyError(error), streaming: false, error: true };
-        });
-        return {
-          ...conversation,
-          memory: rebuildConversationMemory(nextMessages, requestTopicState, conversation.memory),
-          updatedAt: Date.now(),
-          messages: nextMessages
-        };
+          const partial = message.content.trim();
+          const content = failure.kind === "cancelled" && partial
+            ? `${partial}\n\nResponse stopped. Retry?`
+            : failure.message;
+          return {
+            ...message,
+            content,
+            streaming: false,
+            error: true,
+            failure: {
+              kind: failure.kind,
+              userMessageId: userMessage.id,
+              forceWeb,
+              retryCount
+            }
+          };
+        })
+      }));
+      setOperation(failure.kind === "cancelled" ? "cancelled" : "error");
+      const serviceFailure = failure.kind === "ollama" || failure.kind === "model" || failure.kind === "searxng" || failure.kind === "vision"
+        ? failure.kind
+        : failure.timeout ? progress.phase === "searching" ? "searxng" : progress.phase === "vision" ? "vision" : "ollama" : undefined;
+      logDiagnostic({
+        operation: progress.phase,
+        route: predicted,
+        durationMs: Math.round(performance.now() - started),
+        timeout: failure.timeout,
+        cancelled: failure.kind === "cancelled",
+        serviceFailure,
+        retryCount,
+        errorClass: failure.kind
       });
+      if (failure.kind === "ollama" || failure.kind === "model") void refreshOllamaStatus();
+      if (failure.kind === "searxng") setSearxngOnline(false);
     } finally {
-      generationRef.current = null;
-      setBusy(false);
-      setPhase(null);
-      void refreshOllamaStatus();
+      if (generationRef.current === controller) generationRef.current = null;
+      submissionRef.current = false;
     }
+  }
+
+  async function send() {
+    if (!canSend || !activeConversation || submissionRef.current || Date.now() - lastSubmissionAtRef.current < 400) return;
+    lastSubmissionAtRef.current = Date.now();
+    submissionRef.current = true;
+
+    const conversationId = activeConversation.id;
+    const text = input.trim() || "Describe this image.";
+    const sentAttachments = attachments;
+    const forceWeb = webForced;
+    const userMessage: UiMessage = {
+      id: crypto.randomUUID(),
+      role: "user",
+      content: text,
+      attachments: sentAttachments,
+      createdAt: Date.now()
+    };
+    const assistantId = crypto.randomUUID();
+    const assistantMessage: UiMessage = {
+      id: assistantId,
+      role: "assistant",
+      content: "",
+      route: predictedRoute(text, Boolean(sentAttachments.length), forceWeb, messages),
+      createdAt: Date.now(),
+      streaming: true
+    };
+    const requestMessages = [...messages.filter(message => !message.error), userMessage];
+    const requestTopicState = deriveTopicState(requestMessages, activeConversation.context);
+    const requestMemory = rebuildConversationMemory(requestMessages, requestTopicState, activeConversation.memory);
+    const hasPriorUserMessage = messages.some(message => message.role === "user");
+
+    updateConversation(conversationId, conversation => ({
+      ...conversation,
+      context: requestTopicState,
+      memory: requestMemory,
+      title: hasPriorUserMessage ? conversation.title : titleForMessage(text, Boolean(sentAttachments.length)),
+      updatedAt: Date.now(),
+      messages: [...conversation.messages, userMessage, assistantMessage]
+    }));
+    setInput("");
+    setAttachments([]);
+    setWebForced(false);
+    await executeRequest({
+      conversationId,
+      userMessage,
+      assistantId,
+      requestMessages,
+      requestTopicState,
+      requestMemory,
+      forceWeb,
+      retryCount: 0
+    });
+  }
+
+  async function retryMessage(message: UiMessage) {
+    if (busy || updateStatus === "downloading" || submissionRef.current || !activeConversation || !message.failure?.userMessageId || Date.now() - lastSubmissionAtRef.current < 400) return;
+    const assistantIndex = activeConversation.messages.findIndex(item => item.id === message.id);
+    const userIndex = activeConversation.messages.findIndex(item => item.id === message.failure?.userMessageId);
+    if (assistantIndex < 0 || userIndex < 0 || userIndex >= assistantIndex) return;
+    const userMessage = activeConversation.messages[userIndex];
+    const requestMessages = activeConversation.messages
+      .slice(0, assistantIndex)
+      .filter(item => !item.error);
+    const requestTopicState = rebuildTopicState(requestMessages);
+    const requestMemory = rebuildConversationMemory(requestMessages, requestTopicState);
+    const retryCount = message.failure.retryCount + 1;
+    lastSubmissionAtRef.current = Date.now();
+    submissionRef.current = true;
+    updateConversation(activeConversation.id, conversation => ({
+      ...conversation,
+      updatedAt: Date.now(),
+      messages: conversation.messages.map(item => item.id === message.id ? {
+        ...item,
+        content: "",
+        streaming: true,
+        error: false,
+        failure: undefined
+      } : item)
+    }));
+    await executeRequest({
+      conversationId: activeConversation.id,
+      userMessage,
+      assistantId: message.id,
+      requestMessages,
+      requestTopicState,
+      requestMemory,
+      forceWeb: message.failure.forceWeb,
+      retryCount
+    });
   }
 
   function stopGeneration() {
@@ -768,13 +1037,21 @@ function App() {
     window.setTimeout(() => setCopiedId(null), 1400);
   }
 
+  async function copyModelInstallCommand() {
+    await navigator.clipboard.writeText(`ollama pull ${MODEL_BY_MODE[mode]}`);
+    setComposerNotice("Model install command copied.");
+    window.setTimeout(() => setComposerNotice(""), 2200);
+  }
+
   const phaseLabel = phase === "searching"
     ? "Searching web…"
     : phase === "verifying"
       ? "Checking sources…"
+      : phase === "vision"
+        ? "Processing image…"
       : phase === "generating"
         ? "Answering…"
-        : "Thinking…";
+        : "Resolving context…";
 
   return (
     <div
@@ -788,7 +1065,7 @@ function App() {
         <div className="titlebar-brand" data-tauri-drag-region>
           <DotLogo compact />
           <span className={`local-state ${ready ? "online" : ""}`}>
-            <i /> {ready ? "LOCAL" : "OFFLINE"}
+            <i /> {ready ? "LOCAL" : ollamaHealth?.reachable ? "MODEL MISSING" : "LOCAL UNAVAILABLE"}
           </span>
           <button className="titlebar-sidebar-toggle" onClick={toggleSidebar} aria-label="Toggle sidebar">
             {sidebarCollapsed ? <PanelLeftOpen size={15} /> : <PanelLeftClose size={15} />}
@@ -945,6 +1222,13 @@ function App() {
                           </button>
                         </div>
                       ) : null}
+                      {message.role === "assistant" && message.error && message.failure?.userMessageId ? (
+                        <div className="message-actions error-actions">
+                          <button onClick={() => void retryMessage(message)} disabled={busy}>
+                            <RefreshCw size={13} /> Retry
+                          </button>
+                        </div>
+                      ) : null}
                     </div>
                   </article>
                 ))}
@@ -998,7 +1282,7 @@ function App() {
                 value={input}
                 onChange={event => setInput(event.target.value)}
                 onKeyDown={handleComposerKeyDown}
-                placeholder={ready ? "Ask anything…" : "Start Ollama to use NTH."}
+                placeholder="Ask anything…"
                 rows={1}
                 disabled={busy}
               />
@@ -1024,7 +1308,7 @@ function App() {
               )}
             </div>
             <div className="composer-footer">
-              <span className={composerNotice ? "notice" : ""}>{composerNotice || "ENTER TO SEND · SHIFT+ENTER FOR NEW LINE"}</span>
+              <span className={composerNotice || storageNotice ? "notice" : ""}>{storageNotice || composerNotice || "ENTER TO SEND · SHIFT+ENTER FOR NEW LINE"}</span>
               <span>{mode} · GEMMA 4 12B Q4 · THINK OFF</span>
             </div>
           </div>
@@ -1089,7 +1373,16 @@ function App() {
               <h3>LOCAL ENGINE</h3>
               <div className="status-card">
                 <div className={`status-pulse ${ready ? "online" : ""}`}><i /></div>
-                <div><strong>Ollama</strong><span>{checkingStatus ? "Checking…" : ready ? "Connected at 127.0.0.1:11434" : "Not connected"}</span></div>
+                <div>
+                  <strong>Ollama</strong>
+                  <span>{checkingStatus
+                    ? "Checking…"
+                    : ready
+                      ? "Ready · active model installed"
+                      : ollamaHealth?.reachable
+                        ? "Connected · required model missing"
+                        : "LOCAL unavailable · Ollama is not running"}</span>
+                </div>
                 <button onClick={() => void refreshOllamaStatus()} aria-label="Refresh Ollama status"><RefreshCw size={14} /></button>
               </div>
             </section>
@@ -1103,7 +1396,7 @@ function App() {
                   <small>{updateMessage}</small>
                 </div>
                 {updateInfo && updateStatus !== "error" ? (
-                  <button onClick={() => void applyUpdate()} disabled={updateStatus === "downloading"}>
+                  <button onClick={() => void applyUpdate()} disabled={busy || updateStatus === "downloading"}>
                     {updateStatus === "downloading" ? <RefreshCw className="spin" size={14} /> : <Download size={14} />}
                     <span>{updateStatus === "downloading" ? (updatePercent === null ? "INSTALLING" : `${updatePercent}%`) : `INSTALL ${updateInfo.version}`}</span>
                   </button>
@@ -1130,6 +1423,19 @@ function App() {
                 />
                 <small>Used only when WEB is selected or current information is needed.</small>
               </label>
+              <div className="service-inline">
+                <span>{checkingWebStatus
+                  ? "STATUS · CHECKING"
+                  : searxngOnline === true
+                    ? "STATUS · READY"
+                    : searxngOnline === false
+                      ? "STATUS · UNAVAILABLE"
+                      : "STATUS · NOT CHECKED"}</span>
+                <button onClick={() => void refreshSearXNGStatus()} disabled={checkingWebStatus}>
+                  <RefreshCw className={checkingWebStatus ? "spin" : ""} size={12} />
+                  {searxngOnline === false ? "RETRY" : "CHECK"}
+                </button>
+              </div>
             </section>
 
             <section className="settings-section">
@@ -1138,6 +1444,11 @@ function App() {
               <div className="model-card">
                 <div><span>ACTIVE MODEL</span><strong>Gemma 4 12B Q4</strong></div>
                 <code>{MODEL_BY_MODE[mode]}</code>
+                {ollamaHealth?.reachable && !ollamaHealth.modelInstalled ? (
+                  <button className="model-recovery" onClick={() => void copyModelInstallCommand()}>
+                    <Copy size={12} /> COPY INSTALL COMMAND
+                  </button>
+                ) : null}
               </div>
               <div className="frozen-grid">
                 <div><span>POLICY</span><strong>NTH v2</strong></div>

@@ -608,6 +608,9 @@ button:focus-visible, textarea:focus-visible, input:focus-visible {
   cursor: pointer;
 }
 .message-actions button:hover { color: #aaa9a4; background: #121213; }
+.message-actions button:disabled { opacity: .45; cursor: default; }
+.error-actions button { border: 1px solid #4a2927; background: #1b1110; color: #d17a76; }
+.error-actions button:hover:not(:disabled) { border-color: #6b3531; background: #241311; color: #f09a95; }
 
 .source-section { margin-top: 17px; }
 .source-toggle {
@@ -955,12 +958,34 @@ button:focus-visible, textarea:focus-visible, input:focus-visible {
 }
 .settings-field input:focus { border-color: #454548; }
 .settings-field small, .settings-note { color: #585854; font-size: 9px; line-height: 1.55; }
+.service-inline { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 9px; }
+.service-inline > span { color: #666661; font-family: "Cascadia Mono", Consolas, monospace; font-size: 7.5px; letter-spacing: .08em; }
+.service-inline button, .model-recovery {
+  min-height: 27px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 9px;
+  border: 1px solid #303032;
+  border-radius: 14px;
+  background: #1a1a1b;
+  color: #8c8c87;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 7px;
+  font-weight: 700;
+  letter-spacing: .07em;
+  cursor: pointer;
+}
+.service-inline button:hover:not(:disabled), .model-recovery:hover { border-color: #49494b; color: #e0e0dc; }
+.service-inline button:disabled { opacity: .5; cursor: default; }
 .settings-mode .mode-selector { width: 100%; grid-template-columns: repeat(3, 1fr); margin-bottom: 10px; }
 .model-card { display: grid; gap: 9px; padding: 12px; border: 1px solid #242426; border-radius: 10px; background: #131314; }
 .model-card > div { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
 .model-card span, .frozen-grid span { color: #555551; font-family: "Cascadia Mono", Consolas, monospace; font-size: 7px; letter-spacing: .1em; }
 .model-card strong { color: #c4c4bf; font-size: 10px; font-weight: 600; }
 .model-card code { overflow: hidden; color: #666661; text-overflow: ellipsis; white-space: nowrap; font-family: "Cascadia Mono", Consolas, monospace; font-size: 7.5px; }
+.model-card .model-recovery { justify-self: start; border-color: #4b2927; color: #ce7672; }
 .frozen-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-top: 8px; }
 .frozen-grid div { display: grid; gap: 5px; padding: 9px; border: 1px solid #202022; border-radius: 8px; background: #111112; }
 .frozen-grid strong { color: #999994; font-family: "Cascadia Mono", Consolas, monospace; font-size: 8px; }

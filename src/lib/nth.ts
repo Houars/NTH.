@@ -1,5 +1,6 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { NTH_POLICY_V2 } from "./policy";
+import { logDiagnostic } from "./diagnostics";
 import {
   calculateAge,
   decomposePrompt,
@@ -81,7 +82,23 @@ export type NthAnswer = {
   diagnostics: ContextDiagnostics;
 };
 
-export type AnswerPhase = "searching" | "generating" | "verifying";
+export type AnswerPhase = "resolving_context" | "searching" | "generating" | "verifying" | "vision";
+
+export type OllamaHealth = {
+  reachable: boolean;
+  modelInstalled: boolean;
+  expectedModel: string;
+  installedModels: string[];
+};
+
+export type NthFailureKind = "cancelled" | "timeout" | "ollama" | "model" | "searxng" | "vision" | "service";
+
+export type NthFailure = {
+  kind: NthFailureKind;
+  message: string;
+  retryable: boolean;
+  timeout: boolean;
+};
 
 type StreamEvent = {
   event: "token" | "done" | "stopped";
@@ -98,6 +115,38 @@ export function needsWeb(text: string, recentMessages: ContextMessage[] = []): b
 
 export async function pingOllama(): Promise<boolean> {
   return invoke<boolean>("ollama_ping");
+}
+
+export function checkOllamaHealth(model: string): Promise<OllamaHealth> {
+  return invoke<OllamaHealth>("ollama_health", { model });
+}
+
+export function pingSearXNG(searxngUrl: string): Promise<boolean> {
+  return invoke<boolean>("searxng_ping", { searxngUrl });
+}
+
+export function classifyNthError(error: unknown, expectedModel: string, hasVision = false): NthFailure {
+  const raw = error instanceof Error ? error.message : String(error);
+  if (/abort|cancelled|canceled/i.test(raw)) {
+    return { kind: "cancelled", message: "Operation stopped.", retryable: true, timeout: false };
+  }
+  if (/timed?\s*out|timeout|deadline/i.test(raw)) {
+    const operation = /web|searxng/i.test(raw) ? "Web search" : hasVision ? "Image processing" : "The local response";
+    return { kind: "timeout", message: `${operation} timed out. Retry?`, retryable: true, timeout: true };
+  }
+  if (/model.+(?:missing|not found|unavailable)|(?:missing|not found).+model/i.test(raw)) {
+    return { kind: "model", message: `The required model is missing: ${expectedModel}. Install it in Ollama, then Retry.`, retryable: true, timeout: false };
+  }
+  if (/searxng|searches failed|search query|web search/i.test(raw)) {
+    return { kind: "searxng", message: "Web search is unavailable. Check SearXNG, then Retry.", retryable: true, timeout: false };
+  }
+  if (hasVision && /image|vision|decode|base64|unsupported|payload/i.test(raw)) {
+    return { kind: "vision", message: "NTH could not process that image. Check its format or size, then Retry.", retryable: true, timeout: false };
+  }
+  if (/ollama|11434|connection refused|failed to fetch|connection/i.test(raw)) {
+    return { kind: "ollama", message: `LOCAL is unavailable. Start Ollama for ${expectedModel}, then Retry.`, retryable: true, timeout: false };
+  }
+  return { kind: "service", message: "NTH could not finish that response. Retry?", retryable: true, timeout: false };
 }
 
 function stripDataUrl(dataUrl: string): string {
@@ -362,40 +411,107 @@ function transientSearchFailure(error: unknown): boolean {
   return /timeout|timed out|connection|connect|refused|temporar|unavailable|all searxng searches failed/i.test(String(error));
 }
 
-async function searchWithOneRetry(request: { question: string; query: string }, web: WebSettings): Promise<SearchBundle> {
+async function operationTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  operationId: string,
+  message: string,
+  signal?: AbortSignal
+): Promise<T> {
+  let timer = 0;
+  let abort: (() => void) | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    abort = () => {
+      void invoke("cancel_operation", { operationId }).catch(() => undefined);
+      reject(abortError());
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+    timer = window.setTimeout(() => {
+      void invoke("cancel_operation", { operationId }).catch(() => undefined);
+      reject(new Error(message));
+    }, timeoutMs);
+  });
   try {
-    return await invoke<SearchBundle>("searxng_smart_search", {
-      query: request.query,
-      searxngUrl: web.searxngUrl,
-      maxSources: 6
-    });
+    return await Promise.race([promise, timeout]);
+  } finally {
+    window.clearTimeout(timer);
+    if (abort) signal?.removeEventListener("abort", abort);
+  }
+}
+
+async function abortableDelay(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) throw abortError();
+  await new Promise<void>((resolve, reject) => {
+    const abort = () => {
+      window.clearTimeout(timer);
+      reject(abortError());
+    };
+    const timer = window.setTimeout(() => {
+      signal?.removeEventListener("abort", abort);
+      resolve();
+    }, milliseconds);
+    signal?.addEventListener("abort", abort, { once: true });
+  });
+}
+
+async function searchWithOneRetry(
+  request: { question: string; query: string },
+  web: WebSettings,
+  operationId: string,
+  signal?: AbortSignal
+): Promise<SearchBundle> {
+  const search = () => {
+    if (signal?.aborted) throw abortError();
+    const requestId = `${operationId}:search:${crypto.randomUUID()}`;
+    return operationTimeout(invoke<SearchBundle>("searxng_smart_search", {
+      query: request.query, searxngUrl: web.searxngUrl, maxSources: 6, operationId: requestId
+    }), 7_000, requestId, "Web search timed out.", signal);
+  };
+  try {
+    return await search();
   } catch (error) {
+    if (signal?.aborted) throw abortError();
     if (!transientSearchFailure(error)) throw error;
-    await new Promise(resolve => window.setTimeout(resolve, 280));
-    return invoke<SearchBundle>("searxng_smart_search", {
-      query: request.query,
-      searxngUrl: web.searxngUrl,
-      maxSources: 6
-    });
+    logDiagnostic({ operation: "search_retry", route: "web", retryCount: 1, serviceFailure: "searxng", errorClass: "TransientSearchFailure" });
+    await abortableDelay(280, signal);
+    return search();
   }
 }
 
 async function searchWithConcurrency(
   requests: Array<{ question: string; query: string }>,
   web: WebSettings,
+  operationId: string,
+  signal?: AbortSignal,
   concurrency = 2
 ): Promise<SearchBundle[]> {
+  const scope = new AbortController();
+  const abort = () => scope.abort();
+  signal?.addEventListener("abort", abort, { once: true });
+  if (signal?.aborted) scope.abort();
   const results = new Array<SearchBundle>(requests.length);
   let cursor = 0;
   const worker = async () => {
     while (cursor < requests.length) {
+      if (scope.signal.aborted) throw abortError();
       const index = cursor;
       cursor += 1;
-      results[index] = await searchWithOneRetry(requests[index], web);
+      results[index] = await searchWithOneRetry(requests[index], web, operationId, scope.signal);
     }
   };
-  await Promise.all(Array.from({ length: Math.min(concurrency, requests.length) }, worker));
-  return results;
+  const workers = Array.from({ length: Math.min(concurrency, requests.length) }, worker);
+  try {
+    await operationTimeout(Promise.all(workers), 25_000, operationId, "Web search timed out.", signal);
+    return results;
+  } catch (error) {
+    // Stop siblings and queued subquestions before returning control to the UI.
+    scope.abort();
+    await Promise.allSettled(workers);
+    throw error;
+  } finally {
+    signal?.removeEventListener("abort", abort);
+  }
 }
 
 function uniqueSources(bundles: SearchBundle[], maximum = 10): SearchSource[] {
@@ -416,55 +532,68 @@ async function streamOllamaChat(args: {
   messages: Array<{ role: string; content: string; images: string[] }>;
   maxTokens: number;
   generationId: string;
+  timeoutMs: number;
   signal?: AbortSignal;
   onToken?: (token: string) => void;
 }): Promise<string> {
-  const { model, policy, messages, maxTokens, generationId, signal, onToken } = args;
+  const { model, policy, messages, maxTokens, generationId, timeoutMs, signal, onToken } = args;
   const onEvent = new Channel<StreamEvent>();
   let streamed = "";
+  let acceptingTokens = true;
 
   onEvent.onmessage = event => {
-    if (event.event === "token" && event.data) {
+    if (acceptingTokens && !signal?.aborted && event.event === "token" && event.data) {
       streamed += event.data;
       onToken?.(event.data);
     }
   };
 
   const cancel = () => {
-    void invoke("cancel_generation", { generationId }).catch(() => undefined);
+    void invoke("cancel_operation", { operationId: generationId }).catch(() => undefined);
   };
 
   if (signal?.aborted) throw abortError();
   signal?.addEventListener("abort", cancel, { once: true });
 
   try {
-    const result = await invoke<{ content: string }>("ollama_chat_stream", {
-      model,
-      policy,
-      messages,
-      maxTokens,
+    const result = await operationTimeout(
+      invoke<{ content: string }>("ollama_chat_stream", {
+        model,
+        policy,
+        messages,
+        maxTokens,
+        generationId,
+        onEvent
+      }),
+      timeoutMs,
       generationId,
-      onEvent
-    });
+      "Ollama generation timed out.",
+      signal
+    );
     if (signal?.aborted) throw abortError();
     return result.content?.trim() || streamed.trim();
   } finally {
+    acceptingTokens = false;
     signal?.removeEventListener("abort", cancel);
   }
 }
 
-export async function answerNth(args: {
+export type NthAnswerArgs = {
   messages: NthMessage[];
   mode: NthMode;
   forceWeb: boolean;
   web: WebSettings;
+  operationId: string;
   topicState?: TopicState;
   memory?: ConversationMemory;
   signal?: AbortSignal;
   onToken?: (token: string) => void;
   onPhase?: (phase: AnswerPhase) => void;
-}): Promise<NthAnswer> {
-  const { messages, mode, forceWeb, web, topicState: previousTopicState, memory, signal, onToken, onPhase } = args;
+};
+
+async function answerNthOperation(args: NthAnswerArgs): Promise<NthAnswer> {
+  const { messages, mode, forceWeb, web, operationId, topicState: previousTopicState, memory, signal, onToken, onPhase } = args;
+  onPhase?.("resolving_context");
   let lastUserIndex = -1;
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     if (messages[index].role === "user") {
@@ -520,14 +649,17 @@ export async function answerNth(args: {
           : request.query
       }));
   const resolvedQuery = searchRequests.map(request => request.query).join(" | ") || text;
-  const generationId = crypto.randomUUID();
+  const generationId = `${operationId}:generation`;
 
   let sources: SearchSource[] = [];
   let policy = NTH_POLICY_V2;
   let evidence = "";
   let intent = "";
   let contextReused = false;
+  let localWebFallback = false;
   let finalTopicState = nextTopicState;
+  const allowLocalFallback = /\b(?:local fallback|without web|answer locally|use local)\b/i.test(text)
+    && !/\b(?:no|not|never|don't)\b[^.!?\n]{0,50}\b(?:local|locally|without web|fallback)\b/i.test(text);
 
   if (historyIntent) policy = conversationHistoryPolicy(messages);
 
@@ -557,7 +689,16 @@ export async function answerNth(args: {
 
   if (searchRequests.length && !contextReused) {
     onPhase?.("searching");
-    const bundles = await searchWithConcurrency(searchRequests, web, 2);
+    let bundles: SearchBundle[];
+    try {
+      bundles = await searchWithConcurrency(searchRequests, web, operationId, signal, 2);
+    } catch (error) {
+      if (signal?.aborted) throw abortError();
+      if (!allowLocalFallback) throw error;
+      localWebFallback = true;
+      bundles = [];
+      policy = `${NTH_POLICY_V2}\n\nLOCAL WEB FALLBACK:\nThe user explicitly allowed a LOCAL answer because WEB is unavailable. Start the answer with “LOCAL FALLBACK — may be outdated.” Do not claim that current facts were verified. Do not invent fresh information.\nFAILED SEARCH CONTEXT: ${resolvedQuery}`;
+    }
 
     const unrelatedIndex = bundles.findIndex((bundle, index) =>
       !evidenceMatchesSubject(searchRequests[index], bundle.sources, nextTopicState, searchRequests.length === 1)
@@ -566,21 +707,23 @@ export async function answerNth(args: {
       throw new Error(`SearXNG returned no useful evidence for "${searchRequests[unrelatedIndex].query}".`);
     }
 
-    sources = uniqueSources(bundles);
-    evidence = bundles.map((bundle, index) => [
-      `SUBQUESTION ${index + 1}: ${searchRequests[index].question}`,
-      `RESOLVED QUERY: ${searchRequests[index].query}`,
-      bundle.evidence
-    ].join("\n")).join("\n\n");
-    intent = bundles.find(bundle => shouldVerifyWeb(bundle.intent))?.intent || bundles[0]?.intent || "general_fresh";
-    const orderingRule = subquestions.length > 1
-      ? "\n- Answer every subquestion in the user's original order. Keep the numbering/order clear."
-      : "";
-    policy = webPolicy(evidence, intent, resolvedQuery) + orderingRule + ageGrounding(sources, nextTopicState);
-    finalTopicState = markVerifiedWebContext(
-      nextTopicState,
-      nextTopicState.currentExplicitSubject || searchRequests[0].query
-    );
+    if (!localWebFallback) {
+      sources = uniqueSources(bundles);
+      evidence = bundles.map((bundle, index) => [
+        `SUBQUESTION ${index + 1}: ${searchRequests[index].question}`,
+        `RESOLVED QUERY: ${searchRequests[index].query}`,
+        bundle.evidence
+      ].join("\n")).join("\n\n");
+      intent = bundles.find(bundle => shouldVerifyWeb(bundle.intent))?.intent || bundles[0]?.intent || "general_fresh";
+      const orderingRule = subquestions.length > 1
+        ? "\n- Answer every subquestion in the user's original order. Keep the numbering/order clear."
+        : "";
+      policy = webPolicy(evidence, intent, resolvedQuery) + orderingRule + ageGrounding(sources, nextTopicState);
+      finalTopicState = markVerifiedWebContext(
+        nextTopicState,
+        nextTopicState.currentExplicitSubject || searchRequests[0].query
+      );
+    }
   }
 
   if (signal?.aborted) throw abortError();
@@ -602,22 +745,34 @@ export async function answerNth(args: {
       .map(a => stripDataUrl(a.dataUrl))
   }));
 
-  onPhase?.("generating");
+  onPhase?.(hasVision ? "vision" : "generating");
+  let firstToken = true;
   const draft = await streamOllamaChat({
     model: MODEL_BY_MODE[mode],
     policy,
     messages: apiMessages,
     maxTokens: 512,
     generationId,
+    timeoutMs: 45_000,
     signal,
-    onToken
+    onToken: token => {
+      if (firstToken) {
+        firstToken = false;
+        onPhase?.("generating");
+      }
+      onToken?.(token);
+    }
   });
 
   let finalContent = draft || "No response.";
+  if (localWebFallback && !finalContent.startsWith("LOCAL FALLBACK")) {
+    finalContent = `LOCAL FALLBACK — may be outdated.\n\n${finalContent}`;
+  }
 
   // Evidence verification is useful here because the second pass checks supplied
   // web evidence, not the model's own stale memory. It only runs for risky web intents.
-  if (searchRequests.length && !contextReused && shouldVerifyWeb(intent)) {
+  const performedWeb = searchRequests.length > 0 && !contextReused && !localWebFallback;
+  if (performedWeb && shouldVerifyWeb(intent)) {
     onPhase?.("verifying");
     const verified = await streamOllamaChat({
       model: MODEL_BY_MODE[mode],
@@ -628,7 +783,8 @@ export async function answerNth(args: {
         images: []
       }],
       maxTokens: 256,
-      generationId,
+      generationId: `${operationId}:verification`,
+      timeoutMs: 40_000,
       signal
     });
 
@@ -638,18 +794,31 @@ export async function answerNth(args: {
   }
 
   const route: Route =
-    hasVision && searchRequests.length && !contextReused ? "vision+web" :
+    hasVision && performedWeb ? "vision+web" :
     hasVision ? "vision" :
-    searchRequests.length && !contextReused ? "web" :
+    performedWeb ? "web" :
     "local";
 
   return {
     content: finalContent,
     route,
     sources,
-    searchQuery: searchRequests.length ? resolvedQuery : undefined,
+    searchQuery: performedWeb || contextReused ? resolvedQuery : undefined,
     contextReused,
     topicState: finalTopicState,
     diagnostics: context.diagnostics
   };
+}
+
+export async function answerNth(args: NthAnswerArgs): Promise<NthAnswer> {
+  const cancel = () => {
+    void invoke("cancel_operation", { operationId: args.operationId }).catch(() => undefined);
+  };
+  if (args.signal?.aborted) throw abortError();
+  args.signal?.addEventListener("abort", cancel, { once: true });
+  try {
+    return await answerNthOperation(args);
+  } finally {
+    args.signal?.removeEventListener("abort", cancel);
+  }
 }
